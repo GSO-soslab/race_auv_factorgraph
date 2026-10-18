@@ -1,0 +1,53 @@
+// Factor graph example for DOCK_FUSER_PIPELINE.md (§5).
+// Render:  neato -n2 -Tsvg dock_fuser_factor_graph.dot -o dock_fuser_factor_graph.svg
+//
+// Scenario: one tag, three keyframes. X0 and X2 see tag a; X1 is a
+// fixed-tick keyframe with no tag in view.
+// Positions are in points (72 per inch) and pinned (neato -n2).
+
+graph factor_graph {
+  graph [bgcolor="white", pad="0.3", splines=false, outputorder="edgesfirst", size="5.5,10"];  // size: display width in inches (fits ~74% of an A4 text column)
+  node  [fontname="Helvetica", fontsize=20];
+  edge  [color="#555555", penwidth=1.4];
+
+  // ---------------- Variables (circles) ----------------
+  node [shape=circle, width=0.8, fixedsize=true, style=filled, penwidth=1.6];
+  X0 [label=<X<sub>0</sub>>, pos="100,240", fillcolor="#dbe9f6", color="#2b6cb0"];
+  X1 [label=<X<sub>1</sub>>, pos="300,240", fillcolor="#dbe9f6", color="#2b6cb0"];
+  X2 [label=<X<sub>2</sub>>, pos="500,240", fillcolor="#dbe9f6", color="#2b6cb0"];
+  S  [label="S",             pos="300,105", fillcolor="#fde2c8", color="#c05621"];
+  Ta [label=<T<sub>a</sub>>, pos="300,30",  fillcolor="#d5f0dc", color="#2f855a"];
+
+  // ---------------- Factors (small squares) ----------------
+  node [shape=square, width=0.17, fixedsize=true, style=filled, label="", penwidth=0, fontsize=17];
+
+  // EKF init prior: X0 = E0, the EKF pose when the graph starts (first keyframe only)
+  g0  [pos="5,240",  fillcolor="#1a202c", xlabel="EKF init"];
+
+  // Odometry (relative pose between consecutive keyframes)
+  o01 [pos="200,240", fillcolor="#2b6cb0", xlabel="odom"];
+  o12 [pos="400,240", fillcolor="#2b6cb0", xlabel="odom"];
+
+  // Roll/pitch and depth priors from the EKF, every keyframe
+  a0 [pos="55,300",  fillcolor="#6b46c1", xlabel="roll/pitch"];  d0 [pos="145,300", fillcolor="#b83280", xlabel="depth"];
+  a1 [pos="255,300", fillcolor="#6b46c1", xlabel="roll/pitch"];  d1 [pos="345,300", fillcolor="#b83280", xlabel="depth"];
+  a2 [pos="455,300", fillcolor="#6b46c1", xlabel="roll/pitch"];  d2 [pos="545,300", fillcolor="#b83280", xlabel="depth"];
+
+  // Tag projection (ternary: X_k, S, T_a), one per tag observation
+  p0 [pos="100,165", fillcolor="#c53030", xlabel="proj"];
+  p2 [pos="500,165", fillcolor="#c53030", xlabel="proj"];
+
+  // Tag URDF prior: T_a at its station-URDF pose, sigma = mounting tolerance
+  ma [pos="380,30", fillcolor="#2f855a", xlabel="URDF"];
+
+  // ---------------- Edges ----------------
+  g0 -- X0;
+  X0 -- o01 -- X1;  X1 -- o12 -- X2;
+  a0 -- X0; d0 -- X0;  a1 -- X1; d1 -- X1;  a2 -- X2; d2 -- X2;
+
+  // projection factors: keyframe edge (blue), station edge (orange), tag edge (green)
+  X0 -- p0 [color="#2b6cb0"];  p0 -- S [color="#c05621"];  p0 -- Ta [color="#2f855a"];
+  X2 -- p2 [color="#2b6cb0"];  p2 -- S [color="#c05621"];  p2 -- Ta [color="#2f855a"];
+
+  Ta -- ma;
+}

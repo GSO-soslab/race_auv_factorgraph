@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.ros.org/wiki/package_format3/Description"?>
+<package format="3">
+  <name>dock_fuser</name>
+  <version>0.1.0</version>
+  <description>
+    gtsam iSAM2 factor graph that estimates the docking station pose from
+    AprilTag corner detections and the robot_localization EKF odometry.
+    Design: docs/DOCK_FUSER_PIPELINE.md in the race_auv_factorgraph repo.
+  </description>
+  <maintainer email="dev@example.com">dev</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
