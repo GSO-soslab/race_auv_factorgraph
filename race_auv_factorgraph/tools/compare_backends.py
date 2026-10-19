@@ -414,18 +414,18 @@ def plot(results: List[dict], ref: dict, series: Dict[str, dict], setup, out: st
         a.sharex(axs[0])
 
     def drift(X: np.ndarray) -> np.ndarray:
-        D = X @ np.linalg.inv(E)
-        return np.linalg.norm(D[:, :2, 3], axis=1)
+        """Drift correction: 3D distance between the graph's and the EKF's AUV position."""
+        n = len(X)
+        return np.linalg.norm(X[:, :3, 3] - E[:n, :3, 3], axis=1)
 
     for r in results:
         n = len(r["stamp"])
-        axs[0].plot(t[:n], drift(r["X"]) if n == len(E) else np.linalg.norm(
-            (r["X"] @ np.linalg.inv(E[:n]))[:, :2, 3], axis=1), color=colors[r["name"]], lw=1.0,
-            label=f"{r['name']} (real time)")
+        axs[0].plot(t[:n], drift(r["X"]), color=colors[r["name"]], lw=1.0,
+                    label=f"{r['name']} (real time)")
         axs[1].plot(t[:n], series[r["name"]]["ddock"], color=colors[r["name"]], lw=1.0, label=r["name"])
         axs[2].scatter(t[:n], r["update_ms"], s=1.5, color=colors[r["name"]], label=r["name"])
     axs[0].plot(t, drift(X_lm), color="k", ls="--", lw=1.0, label="batch LM")
-    axs[0].set_ylabel("drift correction\n|X E^-1| xy [m]")
+    axs[0].set_ylabel("drift correction\n‖t(X) − t(E)‖ 3D [m]")
     axs[1].set_ylabel("docking pose X^-1 S\nvs batch LM [cm]")
     axs[2].set_ylabel("update time [ms]")
     axs[2].set_yscale("log")
@@ -518,12 +518,12 @@ def main(argv: List[str] = None) -> None:
     rows, series = analyse(results, ref)
     from ..ros.params import build_setup, getter_from_yaml
     setup = build_setup(getter_from_yaml(args.config), lambda m: None)
-    from .replay_bag import bag_start_time, load_camera_info
+    from .replay_bag import bag_source, bag_start_time, load_camera_info
     load_camera_info(args.bag, setup)
     obs = tag_observations(args.bag, setup, args.start, args.end)
     win = f"{args.start or 0:g}-{args.end if args.end is not None else 'end'} s"
     fig_path = plot(results, ref, series, setup, args.out, bag_start_time(args.bag), obs,
-                    f"{os.path.basename(os.path.normpath(args.bag))}, window {win}: "
+                    f"{bag_source(args.bag)}, window {win}: "
                     f"real-time backends vs batch LM")
 
     st = ref["lm_stats"]

@@ -10,9 +10,12 @@ Usage::
     ros2 run race_auv_factorgraph plot_graph DETECTION_BAG --config tank_dock_fuser.yaml \\
         --start 30 --overview 420 --window 90.5 95.5 --window 228.5 232.5 --out overview.png
 
-The bag is replayed from ``--start`` (seconds from bag start, as for
-``replay_bag``; it must match the run you want to look at, because the
-estimator starts fresh there) up to the end of ``--window``. The factors are
+All times are seconds into the **original recording**: ``bag_test.launch.py``
+writes ``source.yaml`` into its output bag (which recording, from where), so a
+bag holding only part of a recording keeps that recording's time axis; the
+title names the recording. The bag is replayed from ``--start`` (it must match
+the run you want to look at, because the estimator starts fresh there) up to
+the end of ``--window``. The factors are
 taken from ``Backend.full_graph()``, i.e. exactly what the estimator inserted,
 and every factor touching a keyframe inside the window is drawn. A whole run
 is far too dense to read; a few seconds (~25 poses at 5 keyframes/s) shows
@@ -42,7 +45,7 @@ Two panels
 
 **Bottom: the same graph in space** (odom x-y, metres, equal aspect). The
 real-time ``X_k`` estimates (blue, as known at each keyframe), the EKF ``E_k``
-(grey dashed), ``S`` with its x axis, and each tag at ``S * T_j``. Every
+(purple dashed), ``S`` with its x axis, and each tag at ``S * T_j``. Every
 projection factor is a thin line from the AUV pose to the tag it observed,
 coloured as above.
 
@@ -52,7 +55,8 @@ Replays ``--start .. END`` and draws the whole run so the windows can be
 placed in context. Top: bird's-eye view of the EKF ``E_k`` and the real-time
 ``X_k`` track, keyframes with tag factors, the final ``S`` and tags, and a
 labelled box (A, B, ...) around the poses of each ``--window``. Bottom: the
-drift correction ``|D| = |translation(X_k * E_k^-1)|`` over time, a raster of
+drift correction ``||t(X_k) - t(E_k)||`` (3D distance between the graph's and
+the EKF's AUV position) over time, a raster of
 keyframes with tag factors, the time before TRACKING, and the same windows
 shaded with their labels.
 """
@@ -71,7 +75,7 @@ import numpy as np
 from ..core.common import keys as K
 from ..core.init.state_machine import StationState
 from ..ros.params import build_setup, getter_from_yaml
-from .replay_bag import bag_start_time, replay
+from .replay_bag import bag_source, bag_start_time, replay, source_start_time
 
 # Colours shared by both panels.
 C_X_TAG = "#2b6cb0"      # keyframe with tag factors
@@ -81,7 +85,7 @@ C_PROJ_INIT = "#dd6b20"  # projection factor added later (buffered, at initializ
 C_S = "#c05621"
 C_T = "#2f855a"
 C_ANCHOR = "#1a202c"
-C_EKF = "#a0aec0"
+C_EKF = "#805ad5"         # EKF E_k: purple, distinct from the graph track (blue)
 C_HL = "#d69e2e"         # overview: highlighted window segment
 
 
@@ -90,7 +94,7 @@ class KeyframeInfo:
     """What the replay recorded for one keyframe (only the fields the plot needs)."""
 
     k: int
-    t: float                       # seconds from bag start
+    t: float                       # seconds into the original recording
     X: gtsam.Pose3                 # real-time estimate at this keyframe
     E: gtsam.Pose3                 # EKF pose
     state: StationState
@@ -140,7 +144,10 @@ def collect(bag: str, config, start: float, w0: float, w1: float,
     setup = build_setup(get, lambda m: None)
     # Covariance does not affect the graph; skipping it makes the replay faster.
     cfg = dataclasses.replace(setup.cfg, covariance_mode="none")
-    t_bag0 = bag_start_time(bag)
+    # Times are seconds into the original recording (source.yaml), so the
+    # windows mean the same whichever slice of it the bag holds.
+    t_bag0 = source_start_time(bag)
+    shift = bag_start_time(bag) - t_bag0          # bag start, in recording time
     kfs: List[KeyframeInfo] = []
     size = [0]
 
@@ -152,7 +159,8 @@ def collect(bag: str, config, start: float, w0: float, w1: float,
                                 first_factor=size[0], n_factors=n - size[0]))
         size[0] = n
 
-    est, _ = replay(bag, get, setup, cfg=cfg, on_keyframe=on_kf, start=start, end=w1,
+    est, _ = replay(bag, get, setup, cfg=cfg, on_keyframe=on_kf,
+                    start=None if start is None else max(0.0, start - shift), end=w1 - shift,
                     frame_stride=frame_stride)
     if est.n_recoveries:
         print(f"warning: {est.n_recoveries} backend recoveries; only the last backend's "
@@ -303,7 +311,7 @@ def plot(win: Window, png: str, title: str) -> None:
     ax.set_yticklabels(["poses X_k", "tag factors", "station S"] + ["tag T_j"] * len(t_rows))
     ax.set_ylim(Y_X - 1.0, max(t_rows.values(), default=Y_T) + 1.0)
     ax.set_xlim(t_lo - 0.05 * span, t_hi + 0.03 * span)
-    ax.set_xlabel("time since bag start (s)")
+    ax.set_xlabel("time since recording start (s)")
     ax.set_title(f"{len(kf_by_key)} poses, {len(proj)} tag projection factors "
                  f"({n_late} inserted at initialization), "
                  f"{sum(f.kind == 'odom' for f in win.factors)} odometry factors", fontsize=10)
@@ -382,28 +390,52 @@ def overview(bag: str, config, start: Optional[float], end: float,
     get = getter_from_yaml(config)
     setup = build_setup(get, lambda m: None)
     cfg = dataclasses.replace(setup.cfg, covariance_mode="none")
-    t_bag0 = bag_start_time(bag)
+    t_bag0 = source_start_time(bag)               # seconds into the original recording
+    shift = bag_start_time(bag) - t_bag0
     rec = []   # (t, X position, E position, has tag factors, tracking)
 
     def on_kf(est, r, held) -> None:
         rec.append((r.stamp - t_bag0, r.X.translation(), r.E.translation(), bool(r.accepted),
-                    r.state == StationState.TRACKING))
+                    r.state == StationState.TRACKING, r.seeded_from_tag))
 
-    est, _ = replay(bag, get, setup, cfg=cfg, on_keyframe=on_kf, start=start, end=end,
+    est, _ = replay(bag, get, setup, cfg=cfg, on_keyframe=on_kf,
+                    start=None if start is None else max(0.0, start - shift), end=end - shift,
                     frame_stride=frame_stride)
     t = np.array([r[0] for r in rec])
     X = np.array([r[1] for r in rec])
     E = np.array([r[2] for r in rec])
     tag = np.array([r[3] for r in rec])
     trk = np.array([r[4] for r in rec])
+    seeded = np.array([r[5] for r in rec])
     labels = [chr(ord("A") + i) for i in range(len(windows))]
 
     fig, (ax, bx) = plt.subplots(2, 1, figsize=(13, 13), gridspec_kw={"height_ratios": [3, 1]})
 
     # ------------------------------------------------------------ BEV
-    ax.plot(E[:, 0], E[:, 1], ls="--", c=C_EKF, lw=0.9, label="EKF E_k")
-    ax.plot(X[:, 0], X[:, 1], c=C_X_TAG, lw=0.8, alpha=0.7, label="graph X_k (real time)")
-    ax.scatter(X[tag, 0], X[tag, 1], s=4, c=C_X_TAG, zorder=3, label="keyframe with tag factors")
+    ax.plot(E[:, 0], E[:, 1], ls="--", c=C_EKF, lw=1.1, label="EKF E_k")
+    # The graph track is one solid line through every keyframe; the dots on
+    # it mark keyframes with tag factors (small, so they do not break it up).
+    ax.plot(X[:, 0], X[:, 1], c=C_X_TAG, lw=1.3, label="graph X_k (real time)")
+    ax.scatter(X[tag, 0], X[tag, 1], s=2, c=C_X_TAG, zorder=3, label="keyframe with tag factors")
+    # The only real steps in the real-time track: keyframes that started at
+    # the tag-implied pose after a stretch without tags (drift corrected at once).
+    if seeded.any():
+        ax.scatter(X[seeded, 0], X[seeded, 1], s=45, marker="D", facecolors="none",
+                   edgecolors="magenta", linewidths=1.2, zorder=6,
+                   label=f"X_k restarted at the tag-implied pose ({seeded.sum()})")
+    # Where the two tracks start and end (they coincide at the start: X_0 = E_0).
+    ax.scatter([X[0, 0]], [X[0, 1]], s=60, marker="o", c="white", edgecolors="black", zorder=7,
+               label=f"start, {t[0]:.0f} s")
+    for P, c, name in ((X, C_X_TAG, "graph"), (E, C_EKF, "EKF")):
+        ax.scatter([P[-1, 0]], [P[-1, 1]], s=80, marker="X", c=c, edgecolors="black",
+                   linewidths=0.8, zorder=7)
+        # Graph label to the left (S and the tags sit to the right of the
+        # end of a docking run), EKF label below right.
+        left = name == "graph"
+        ax.annotate(f"{name} end, {t[-1]:.0f} s", (P[-1, 0], P[-1, 1]),
+                    xytext=(-8, 6) if left else (8, -12), ha="right" if left else "left",
+                    textcoords="offset points", fontsize=9, color=c, fontweight="bold",
+                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=1.0))
     S = est.backend.pose(K.S)
     if S is not None:
         s = S.translation()
@@ -450,8 +482,11 @@ def overview(bag: str, config, start: Optional[float], end: float,
     ax.legend(fontsize=9, loc="best")
 
     # ------------------------------------------------------------ time strip
-    D = np.linalg.norm(X - E, axis=1)   # |translation of X_k * E_k^-1| up to the yaw lever arm
-    bx.plot(t, D, c=C_X_TAG, lw=1.0, label="drift correction |X_k − E_k| (m)")
+    # Drift correction: 3D distance between the graph's and the EKF's AUV
+    # position at each keyframe (independent of where the odom origin is).
+    D = np.linalg.norm(X - E, axis=1)
+    bx.plot(t, D, c=C_X_TAG, lw=1.0,
+            label="drift correction ‖t(X_k) − t(E_k)‖, 3D (m)")
     ymax = max(float(D.max()) * 1.15, 0.05)
     bx.vlines(t[tag], ymax * 0.93, ymax, color=C_X_TAG, lw=0.4, label="keyframe with tag factors")
     pre = ~trk
@@ -462,8 +497,8 @@ def overview(bag: str, config, start: Optional[float], end: float,
         bx.text(0.5 * (w0 + w1), ymax * 0.82, lab, ha="center", fontsize=10, fontweight="bold")
     bx.set_ylim(0, ymax)
     bx.set_xlim(t[0], t[-1])
-    bx.set_xlabel("time since bag start (s)")
-    bx.set_ylabel("m")
+    bx.set_xlabel("time since recording start (s)")
+    bx.set_ylabel("drift correction, 3D (m)")
     bx.legend(fontsize=8, loc="lower left", ncol=3, frameon=False, bbox_to_anchor=(0.0, 1.0))
     bx.grid(alpha=0.3)
 
@@ -478,26 +513,35 @@ def main(argv: List[str] = None) -> None:
     ap.add_argument("bag", help="rosbag2 directory with EKF odometry and tag detections")
     ap.add_argument("--config", required=True, nargs="+", help="dock_fuser parameter file(s), merged in order")
     ap.add_argument("--start", type=float, default=None,
-                    help="replay start, s from bag start (the estimator starts fresh here)")
+                    help="replay start, s into the original recording (the estimator starts fresh here)")
     ap.add_argument("--window", type=float, nargs=2, action="append", required=True,
                     metavar=("FROM", "TO"),
-                    help="time window, s from bag start (a few seconds). Graph mode: exactly "
+                    help="time window, s into the original recording (a few seconds). Graph mode: exactly "
                          "one. Overview: repeat to box several")
     ap.add_argument("--label", default="", help="graph mode: label in the title, e.g. A")
     ap.add_argument("--overview", type=float, default=None, metavar="END",
-                    help="draw the whole run up to END (s from bag start) with a box per window")
+                    help="draw the whole run up to END (s into the original recording) with a box per window")
     ap.add_argument("--frame-stride", type=int, default=1,
                     help="keep every Nth detector image, e.g. 3 to replay a 15 Hz bag at 5 Hz")
     ap.add_argument("--out", default="graph.png", help="output image")
     args = ap.parse_args(argv)
-    name = os.path.basename(os.path.normpath(args.bag))
-    since = f" (replay from {args.start:g} s)" if args.start is not None else ""
+    name = bag_source(args.bag)        # the original recording, if bag_test noted it
+    # "replay from" only when the replay starts later than the bag itself
+    # (a bag that holds part of a recording already says where it starts).
+    bag_begins = bag_start_time(args.bag) - source_start_time(args.bag)
+    since = (f" (replay from {args.start:g} s)"
+             if args.start is not None and args.start > bag_begins + 1.0 else "")
     rate = f", frame stride {args.frame_stride}" if args.frame_stride > 1 else ""
+    # Which estimate is drawn: the real-time X_k of the fixed-lag smoother
+    # with this config's lag (as the node computes it), not a re-smoothing.
+    lag = float(getter_from_yaml(args.config)("estimator.smoother_lag"))
+    backend = f"\nfixed-lag smoother {lag:g} s, real-time estimates"
     if args.overview is not None:
         t0 = args.start if args.start is not None else 0.0
         overview(args.bag, args.config, args.start, args.overview,
                  [tuple(w) for w in args.window], args.out,
-                 f"{name}, {t0:g}–{args.overview:g} s{rate}: whole run, with the factor-graph windows",
+                 f"{name}, {t0:g}–{args.overview:g} s{rate}: whole run, with the factor-graph windows"
+                 f"{backend}",
                  frame_stride=args.frame_stride)
         return
     if len(args.window) != 1:
@@ -505,7 +549,7 @@ def main(argv: List[str] = None) -> None:
     w0, w1 = args.window[0]
     win = collect(args.bag, args.config, args.start, w0, w1, args.frame_stride)
     prefix = f"{args.label}: " if args.label else ""
-    plot(win, args.out, f"{prefix}Factor graph, {name}, {w0:g}–{w1:g} s{since}{rate}")
+    plot(win, args.out, f"{prefix}Factor graph, {name}, {w0:g}–{w1:g} s{since}{rate}{backend}")
 
 
 if __name__ == "__main__":

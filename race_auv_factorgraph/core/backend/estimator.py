@@ -95,6 +95,16 @@ class KeyframeResult:
         return self.X.compose(self.E.inverse())
 
     @property
+    def drift_distance(self) -> float:
+        """3D distance (m) between the graph's and the EKF's AUV position, ``||t(X_k) - t(E_k)||``.
+
+        The size of the drift correction as plotted and reported. Unlike the
+        translation of ``D``, it does not depend on where the odom origin is
+        (``D``'s translation also carries yaw correction x distance from it).
+        """
+        return float(np.linalg.norm(self.X.translation() - self.E.translation()))
+
+    @property
     def dock_in_base(self) -> Optional[gtsam.Pose3]:
         """``X_k^-1 * S``: dock_point in the AUV base_link. This is what docking uses."""
         return None if self.S is None else self.X.between(self.S)

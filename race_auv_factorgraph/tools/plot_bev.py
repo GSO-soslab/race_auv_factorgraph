@@ -63,7 +63,7 @@ from ..core.common.model import Detection, normalize_family
 from ..core.frontend.pnp import ippe_tag
 from ..core.frontend.pose_buffer import PoseBuffer
 from ..ros.params import build_setup, getter_from_yaml
-from .replay_bag import load_camera_info
+from .replay_bag import bag_source, load_camera_info
 
 TOPIC_ODOM = "/race_auv/odometry/filtered"
 TOPIC_X = "/dock_fuser/auv_pose"
@@ -307,7 +307,7 @@ def main(argv: List[str] = None) -> None:
     ax.set_xlabel("odom x [m]")
     ax.set_ylabel("odom y [m]")
     what = "iSAM2 real time" + (" vs batch LM" if sol is not None else "")
-    ax.set_title(f"BEV: EKF vs dock_fuser ({what})\n{os.path.basename(os.path.normpath(args.bag))}",
+    ax.set_title(f"BEV: EKF vs dock_fuser ({what})\n{bag_source(args.bag)}",
                  fontsize=10)
     ax.legend(fontsize=7, loc="best")
 

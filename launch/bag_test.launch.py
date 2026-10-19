@@ -79,6 +79,16 @@ RECORD_TOPICS = [
 ]
 
 
+def _write_source(out: str, bag: str, start_offset: str, duration: str) -> list:
+    """Write ``<out>/source.yaml``: the original recording and the replayed window."""
+    with open(os.path.join(out, "source.yaml"), "w", encoding="utf-8") as f:
+        f.write(f"source_bag: {os.path.basename(os.path.normpath(bag))}\n"
+                f"source_path: {os.path.abspath(bag)}\n"
+                f"start_offset: {float(start_offset)}\n"
+                f"duration: {float(duration)}\n")
+    return []
+
+
 def _setup(context, *args, **kwargs):
     lc = lambda name: LaunchConfiguration(name).perform(context)  # noqa: E731
     bag = os.path.expanduser(lc("bag"))
@@ -122,6 +132,10 @@ def _setup(context, *args, **kwargs):
         # other before the first message is played.
         TimerAction(period=float(lc("startup_delay")), actions=[play]),
         RegisterEventHandler(OnProcessExit(target_action=play, on_exit=[
+            # Note which recording and window this bag came from, for the
+            # plot titles (tools/replay_bag.py:bag_source).
+            OpaqueFunction(function=lambda ctx: _write_source(out, bag, lc("start_offset"),
+                                                              lc("duration"))),
             TimerAction(period=float(lc("shutdown_delay")),
                         actions=[EmitEvent(event=Shutdown(reason="bag playback finished"))]),
         ])),

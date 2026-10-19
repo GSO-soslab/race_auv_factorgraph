@@ -158,27 +158,45 @@ Source: [dock_fuser_factor_graph.dot](dock_fuser_factor_graph.dot). Re-render wi
 
 ### The real graph on the tank run
 
-`tools/plot_graph.py` replays a bag and draws the factors the estimator actually inserted, for a few seconds at a time (the whole 30–420 s run has ~1900 poses at 5 Hz). Top: structure, with `X_k` along a time axis and `S`, `T_j` above. Bottom: the same graph in space. Tank run 2026-09-16 16:16:47, replayed from 30 s with `tank_dock_fuser.yaml` (tag 146, `cam_front`). The bag's detector ran at 15 Hz; the figures use `--frame-stride 3`, i.e. every 3rd image, which is what the vehicle's 5 Hz detector sees. One keyframe per detector message, so the poses are evenly spaced at 0.2 s.
+`tools/plot_graph.py` replays a bag and draws the factors the estimator actually inserted, for a few seconds at a time (the whole 30–420 s run has ~1900 poses at 5 Hz). Top: structure, with `X_k` along a time axis and `S`, `T_j` above. Bottom: the same graph in space. Tank recording `rosbag2_2026_09_16-16_16_47`, 30–420 s, with `tank_dock_fuser.yaml` (tag 146, `cam_front`), i.e. the fixed-lag smoother with a 30 s lag exactly as the node runs it. The detections were made from the recorded images by the current tag detector at 5 Hz, as on the vehicle (`bag_test.launch.py`, with the DVL recorded too). All poses shown are the **real-time** estimates (`X_k` as known at keyframe k), not re-smoothed afterwards; times are seconds into the recording. One keyframe per detector message, so the poses are evenly spaced at 0.2 s.
 
-**Overview, 30–420 s.** Where the two windows below come from. Top: the EKF (grey dashed) and the graph's real-time track (blue; thick where the keyframe has tag factors), the final station and tag, and a box around each window with its own segment highlighted (the track passes near B several times). Bottom: the drift correction `|X_k − E_k|` over time, which grows to ~0.46 m by 420 s, a raster of keyframes with tag factors, and the windows shaded.
+**Overview, 30–420 s.** Where the two windows below come from. Top: the EKF (purple dashed) and the graph's real-time track (blue; thick where the keyframe has tag factors), the final station and tag, and a box around each window with its own segment highlighted (the track passes near B several times). The start (circle; the two tracks coincide there, `X_0 = E_0`) and the two end points at 420 s are marked; at the end they are ~0.44 m apart. The real-time track is continuous except at the magenta diamonds: keyframes after ~8 s without tags that started at the tag-implied pose, correcting the drift of the gap in one step (10–14 cm). Bottom: the drift correction over time, the 3D distance `‖t(X_k) − t(E_k)‖` between the graph's and the EKF's AUV position (the same number as `drift_correction_m` in `/diagnostics`; independent of where the odom origin is), which grows to ~0.46 m by 420 s, a raster of keyframes with tag factors, and the windows shaded.
 
 ![Whole run with the two windows](dock_fuser_graph_overview.png)
 
-**A: initialization, 91.5–96.5 s.** Before 94.4 s the station does not exist: tag frames are buffered, and the graph holds only the `X` chain (orange band); white circles are detector messages without a tag. At 94.4 s the vote and batch solve succeed, and `S`, `T_146` and the 5 buffered observations of the last ~2.6 s (orange) enter the graph in one update. From then on, each tag adds its projection factor at its own keyframe (red).
+**A: initialization, 91.5–96.5 s.** Before 94.6 s the station does not exist: tag frames are buffered, and the graph holds only the `X` chain (orange band); white circles are detector messages without a tag. At 94.6 s the vote and batch solve succeed, and `S`, `T_146` and the 4 buffered observations of the last ~2.6 s (orange) enter the graph in one update. From then on, each tag adds its projection factor at its own keyframe (red).
 
 ![Factor graph around initialization](dock_fuser_graph_init.png)
 
-**B: blind gap, 228.5–232.5 s.** Tags in view, then 1.6 s with none: the detector keeps publishing (empty messages), so keyframes continue at 5 Hz with odometry only (white). When the tag returns, its factors resume on the first frame. The bottom panel shows the drift correction: the graph poses (blue) sit ~0.2 m from the EKF (grey dashed).
+**B: blind gap, 228.5–232.5 s.** Tags in view, then ~1.8 s with none: the detector keeps publishing (empty messages), so keyframes continue at 5 Hz with odometry only (white). When the tag returns, its factors resume on the first frame. The bottom panel shows the drift correction: the graph poses (blue) sit ~0.2 m from the EKF (purple dashed).
 
 ![Factor graph across a blind gap](dock_fuser_graph_gap.png)
 
-Re-create (detection bag `tank_test_09_16_26_161647_detections`):
+**Second run, `rosbag2_2026_09_16-18_24_05` (0–335 s).** Same setup. The station is initialized at 114.9 s (A, 4 buffered observations). After a 22 s stretch without tags (202.7–224.5 s), the tag returns at 224.5 s and that keyframe starts at the tag-implied pose (B): the graph poses step ~7 cm onto the tag-consistent track, ~0.2 m from the EKF. The drift correction stays under 0.25 m.
+
+![Second run, whole](dock_fuser_graph_182405_overview.png)
+
+![Second run, initialization](dock_fuser_graph_182405_init.png)
+
+![Second run, tag back after a 22 s gap](dock_fuser_graph_182405_gap.png)
+
+Re-create: first the detection bags, from the recorded images (`bag_test.launch.py`, detection only; it writes `source.yaml` so the figures name the recording and keep its time axis), then the figures:
 
 ```bash
-P="ros2 run race_auv_factorgraph plot_graph <detection bag> --config config/tank_dock_fuser.yaml --start 30 --frame-stride 3"
+R=~/ros2bag/race/tank_test_09_16_26; T=~/ros2bag/dock_fuser_tests
+ros2 launch race_auv_factorgraph bag_test.launch.py bag:=$R/rosbag2_2026_09_16-16_16_47 start_offset:=30 duration:=390 \
+    run_fuser:=false record_images:=false out:=$T/rosbag2_2026_09_16-16_16_47_detections
+ros2 launch race_auv_factorgraph bag_test.launch.py bag:=$R/rosbag2_2026_09_16-18_24_05 start_offset:=0 duration:=100000 \
+    run_fuser:=false record_images:=false out:=$T/rosbag2_2026_09_16-18_24_05_detections
+
+P="ros2 run race_auv_factorgraph plot_graph $T/rosbag2_2026_09_16-16_16_47_detections --config config/tank_dock_fuser.yaml --start 30"
 $P --overview 420 --window 91.5 96.5 --window 228.5 232.5 --out docs/dock_fuser_graph_overview.png
 $P --window 91.5 96.5 --label A --out docs/dock_fuser_graph_init.png
 $P --window 228.5 232.5 --label B --out docs/dock_fuser_graph_gap.png
+P="ros2 run race_auv_factorgraph plot_graph $T/rosbag2_2026_09_16-18_24_05_detections --config config/tank_dock_fuser.yaml"
+$P --overview 335 --window 112 117 --window 222 227 --out docs/dock_fuser_graph_182405_overview.png
+$P --window 112 117 --label A --out docs/dock_fuser_graph_182405_init.png
+$P --window 222 227 --label B --out docs/dock_fuser_graph_182405_gap.png
 ```
 
 Notes:
@@ -548,10 +566,10 @@ ros2 run race_auv_factorgraph compare_backends <detection bag> --config <dock_fu
 
 # Draw the factor graph the estimator built over a few seconds of a replay
 ros2 run race_auv_factorgraph plot_graph <detection bag> --config <dock_fuser yaml> --start 30 \
-    --window 91.5 96.5 --frame-stride 3 --out graph.png
+    --window 91.5 96.5 --out graph.png
 # ... or the whole run with a box around each window
 ros2 run race_auv_factorgraph plot_graph <detection bag> --config <dock_fuser yaml> --start 30 \
-    --frame-stride 3 --overview 420 --window 91.5 96.5 --window 228.5 232.5 --out overview.png
+    --overview 420 --window 91.5 96.5 --window 228.5 232.5 --out overview.png
 
 # Deterministic offline re-run of the fuser on a bag that already has the tags topic.
 # --frame-stride 3 replays a 15 Hz detector bag as the vehicle's 5 Hz detector would see it.

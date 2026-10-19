@@ -439,7 +439,8 @@ class DockFuserNode(Node):
             kv["last_rejected"] = "; ".join(f"{tag_key_str(t)}: {r}" for t, r in res.rejected)
             kv["init_note"] = res.init_note
             D = res.drift_correction
-            kv["drift_correction_m"] = f"{float(np.linalg.norm(D.translation())):.3f}"
+            # 3D distance between the graph's and the EKF's AUV position.
+            kv["drift_correction_m"] = f"{res.drift_distance:.3f}"
             kv["drift_correction_yaw_deg"] = f"{math.degrees(D.rotation().yaw()):.2f}"
         # Timing across machines. age = (local clock when the message arrived)
         # - (its header stamp), i.e. transport + processing delay *plus* any

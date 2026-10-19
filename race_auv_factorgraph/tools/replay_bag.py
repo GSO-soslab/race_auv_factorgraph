@@ -63,6 +63,47 @@ def _pose_cols(prefix: str, T: gtsam.Pose3) -> Dict[str, float]:
             f"{prefix}_yaw": math.degrees(R.yaw())}
 
 
+def bag_source(bag: str) -> str:
+    """Display name of the recording a bag came from, for plot titles.
+
+    ``bag_test.launch.py`` writes ``source.yaml`` into its output bag (the
+    original recording and the replayed window). Without it the bag's own
+    directory name is used.
+    """
+    name = os.path.basename(os.path.normpath(bag))
+    path = os.path.join(bag, "source.yaml")
+    if not os.path.exists(path):
+        return name
+    import yaml
+    with open(path, encoding="utf-8") as f:
+        src = yaml.safe_load(f) or {}
+    out = str(src.get("source_bag", name))
+    if float(src.get("start_offset", 0.0)):
+        out += f" (from {float(src['start_offset']):g} s)"
+    return out
+
+
+def source_start_time(bag: str) -> float:
+    """Start (s) of the original recording a bag came from, the zero of the plot time axes.
+
+    From ``source.yaml`` (``bag_test.launch.py``): the start of the recording
+    at ``source_path`` if it is still there, else this bag's start minus the
+    replayed ``start_offset``. Without ``source.yaml``: this bag's own start.
+    Times on that axis then read as seconds into the original recording,
+    whichever window of it the bag holds.
+    """
+    path = os.path.join(bag, "source.yaml")
+    if not os.path.exists(path):
+        return bag_start_time(bag)
+    import yaml
+    with open(path, encoding="utf-8") as f:
+        src = yaml.safe_load(f) or {}
+    original = src.get("source_path", "")
+    if original and os.path.isdir(original):
+        return bag_start_time(original)
+    return bag_start_time(bag) - float(src.get("start_offset", 0.0))
+
+
 def bag_start_time(bag: str) -> float:
     """Recording start of the bag (seconds), from its metadata."""
     return _open_reader(bag).get_metadata().starting_time.nanoseconds * 1e-9
