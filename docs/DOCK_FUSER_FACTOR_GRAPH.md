@@ -11,7 +11,6 @@ One tag, three keyframes: <i>X</i><sub>0</sub> and <i>X</i><sub>2</sub> see tag 
 | <i>T</i><sub>a</sub> (green) | variable | | Tag a's pose relative to <i>S</i>. Stays at its URDF value with one tag. |
 | **EKF init** (black) | factor | <i>X</i><sub>0</sub> | <i>X</i><sub>0</sub> = <i>E</i><sub>0</sub>, added once. Ties the graph to odom. |
 | **odom** (blue) | factor | <i>X</i><sub>k−1</sub>, <i>X</i><sub>k</sub> | EKF motion <i>E</i><sub>k−1</sub><sup>−1</sup><i>E</i><sub>k</sub>; relative only, as x, y, yaw drift. Huber. |
-| **roll/pitch**, **depth** | factor | <i>X</i><sub>k</sub> | Roll/pitch (gravity, yaw free) and depth (pressure) from the EKF. |
 | **proj** (red) | factor | <i>X</i><sub>k</sub>, <i>S</i>, <i>T</i><sub>a</sub> | 4 tag corner pixels vs. prediction of <i>S</i>·<i>T</i><sub>a</sub> seen from <i>X</i><sub>k</sub>·<i>T</i><sub>bc</sub>. 1 px, Huber. |
 | **URDF** (green) | factor | <i>T</i><sub>a</sub> | <i>T</i><sub>a</sub> near its station-URDF pose; σ = mounting tolerance. |
 

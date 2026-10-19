@@ -1,6 +1,6 @@
 # Dock Fuser: gtsam Pipeline
 
-This document describes the factor-graph pipeline that estimates the docking station's pose from AprilTag corner detections and the `robot_localization` EKF odometry. It is implemented as a Python ROS 2 node using gtsam's iSAM2.
+This document describes the factor-graph pipeline that estimates the docking station's pose from AprilTag corner detections and the `robot_localization` EKF odometry. It is implemented as a Python ROS 2 node using gtsam's fixed-lag smoother (iSAM2 with marginalization).
 
 ---
 
@@ -8,25 +8,19 @@ This document describes the factor-graph pipeline that estimates the docking sta
 
 ```
  /odometry/filtered ──► EKF pose buffer ───────────────┐   (interpolate E(t) at any stamp)
- cam_front corners  ─┐                                 │
- cam_down  corners  ─┴► detection queue ─► pre-filter ─┤
+ cam_front corners  ──► detection queue ───────────────┤   (one keyframe per detector message)
                                                        ▼
                                             ┌─────────────────────┐
                                             │  Keyframe manager   │
                                             └──────────┬──────────┘
                                                        ▼
                           ┌──────────── Factor builders ────────────┐
-                          │  odometry · roll/pitch · depth · tags   │
-                          └────────────────────┬─────────────────────┘
-                                               ▼
-                          ┌──────────────── Gates ──────────────────┐
-                          │  multi-tag consistency → reprojection    │
-                          │  → local solve before admitting factors  │
+                          │  odometry · tags                        │
                           └────────────────────┬─────────────────────┘
                                                ▼
                         Station state (NO_STATION / CANDIDATE / TRACKING)
                                                ▼
-                                         iSAM2 backend
+                                    fixed-lag smoother backend
                                                ▼
                        Output: odom → station TF  +  /dock_point/pose
 ```
@@ -75,40 +69,38 @@ Camera model: the detector runs on rectified images, so corner pixels are alread
 
 | Input | Type | Use |
 |---|---|---|
-| `/odometry/filtered` | `nav_msgs/Odometry` | Pose buffer for odometry, roll/pitch and depth factors. |
-| Per-camera tag detections | Tag ID + 4 corner pixels, stamped | Tag factors and initialization. |
-| Node YAML config | — | `K_C` for each camera, detection topics, noise parameters. |
-| AUV URDF | — | `T_bc` for each camera. |
-| Station URDF | — | Tag poses relative to `dock_point`, tag sizes. |
+| `/race_auv/odometry/filtered` | `nav_msgs/Odometry` | Pose buffer for the odometry factors. |
+| `/cam_<name>/apriltag_detection/tags` | `apriltag_msgs/AprilTagDetectionArray` | Tag ID + 4 corner pixels per tag, stamped with the image time. One camera. Every message, also an empty one, is one keyframe (§6). Tag factors and initialization. |
+| Node YAML config | — | `K_C` of the camera, its detection topic, tag sizes, noise parameters. |
+| AUV URDF | — | `T_bc` of the camera. |
+| Station URDF | — | Tag poses relative to `dock_point` (links `apriltag<family>_<id>`). |
 
-The node does not subscribe to `camera_info`. Camera intrinsics are defined in the YAML config:
+The corner detections come from `tag_detector_node` (`race_auv_perception/race_auv_camera_tag_factorgraph`), a minimal detector made for this pipeline: rectify (cv2), detect tag36h11 (apriltag3, CPU), per-ID tag size, image checks (§8), then publish the corners on `apriltag_detection/tags` and the IPPE pose on `apriltag_detection/detections3d`, one message per processed image (also with no tags), stamped with the image time. It also latches the rectified intrinsics on `apriltag_detection/camera_info`, which is where the fuser takes its camera matrix from (see the table below). Its parameters are in `race_auv_bringup/config/tag_factorgraph_detector.yaml` (launched with the cameras and dock_fuser by `race_auv_bringup/launch/bringup_camera_tag_factorgraph.launch.py`). The older `race_auv_camera_pkg` detector publishes the same topics with the same corner order and can still be used. The corners are in the full-resolution **rectified** image, in a fixed **canonical order**: corner `i` is the image of tag-frame point
 
-```yaml
-dock_fuser:
-  ros__parameters:
-    cameras:
-      cam_front:
-        detections_topic: /cam_front/tag_corners
-        frame: race_auv/cam_front          # T_bc looked up from the AUV URDF
-        # Pinhole matrix of the RECTIFIED image the detector runs on
-        fx: 0.0
-        fy: 0.0
-        cx: 0.0
-        cy: 0.0
-        width: 1600
-        height: 1200
-      cam_down:
-        detections_topic: /cam_down/tag_corners
-        frame: race_auv/cam_down
-        fx: 0.0
-        fy: 0.0
-        cx: 0.0
-        cy: 0.0
-        width: 1600
-        height: 1200
-```
+| i | tag-frame point | |
+|---|---|---|
+| 0 | `(-s/2, +s/2, 0)` | left-bottom |
+| 1 | `(+s/2, +s/2, 0)` | right-bottom |
+| 2 | `(+s/2, -s/2, 0)` | right-top |
+| 3 | `(-s/2, -s/2, 0)` | left-top |
 
-`fx, fy, cx, cy` must be the camera matrix the rectifier maps into, not the raw calibration. If the rectifier uses a new camera matrix (for example from `cv2.fisheye.estimateNewCameraMatrixForUndistortRectify`), that is the matrix that belongs here. A mismatch scales every range estimate.
+(tag frame: x right, y down, z into the tag). This is the apriltag3 `lb-rb-rt-lt` order and the order `cv2.SOLVEPNP_IPPE_SQUARE` needs, so the corners need no reordering and the detector's pose agrees with them by construction. The station URDF tag frames follow the same frame. `race_auv_camera_tag_factorgraph/test/test_tags.py` pins it on rendered tags: the detected corner `i` lands on the projection of `c_i` within 1 px. (The legacy detector's cuAprilTags backend returns its own order and reorders corners into this one, `apriltag_geom.canonical_corner_order`.) On the tank run (30–420 s, 5634 images) both detectors find the same tags with corners 0.03 px apart (median).
+
+`s` is the edge of the **black square**, where the corners are. The sim tags are 0.15 m / 0.05 m textured boxes with a white border, so their black squares are 0.12 m / 0.04 m.
+
+**One source for each input.** Nothing is configured twice:
+
+| What | Single source | Used by |
+|---|---|---|
+| Tag IDs and sizes | `race_auv_bringup/config/station_tags.yaml` (`/**`: `tag_ids`, `tag_sizes`) | detector and fuser; their launch files pass it first |
+| Tag poses on the station, `T_dock_base` | station URDF (`apriltag36h11_<id>` links) | fuser |
+| Camera pose on the AUV, `T_bc` | AUV URDF | fuser |
+| Raw camera calibration | `race_auv_bringup/config/tag_factorgraph_detector.yaml` | detector (rectification) |
+| Rectified camera matrix | the detector's latched `apriltag_detection/camera_info` | fuser |
+
+The fuser waits for the camera_info before processing any frame (frames queue in the scheduler meanwhile; `/diagnostics` says "waiting for camera_info"). The camera's topics and frame follow from its name, so the vehicle config only lists `camera_names: [cam_front]`. The offline tools read the camera_info from the bag (`bag_test.launch.py` records it), and `--config` takes several files merged in order, like the node (`--config station_tags.yaml dock_fuser.yaml`).
+
+`cameras.<name>.fx/fy/cx/cy/width/height` in a config are an override, for inputs without camera_info: the simulation (legacy detector) and replays of older detection bags (`tank_dock_fuser.yaml`). They must be the RECTIFIED camera matrix, not the raw calibration; a mismatch scales every range estimate. When both exist, the node warns if they differ from the camera_info by more than 0.5 px.
 
 ---
 
@@ -130,8 +122,6 @@ No velocity or IMU-bias variables: the EKF already fuses IMU, DVL and pressure, 
 |---|---|---|---|---|
 | EKF init prior | `X_0` | `X_0 ⊖ E_0` | very tight | first keyframe only |
 | Odometry | `X_{k-1}, X_k` | `(X_{k-1}⁻¹ X_k) ⊖ (E_{k-1}⁻¹ E_k)` | random walk (below), Huber | every keyframe |
-| Roll/pitch prior | `X_k` | roll and pitch of `X_k` vs `E_k`; yaw free (`Pose3AttitudeFactor`) | `σ_rp` | every keyframe |
-| Depth | `X_k` | `X_k.z − E_k.z` (`CustomFactor`) | `σ_z` | every keyframe |
 | Tag URDF prior | `T_j` | `T_j ⊖ T_j^URDF` | `σ_mount` | once per tag, at creation |
 | Tag projection | `X_k, S, T_j` | `π(K_C, (X_k · T_bc)⁻¹ · S · T_j · c_i) − uv_i` for i = 1..4 (8 rows) | 1 px per coordinate, Huber | each accepted tag observation |
 
@@ -141,7 +131,7 @@ Also available on its own page: [DOCK_FUSER_FACTOR_GRAPH.md](DOCK_FUSER_FACTOR_G
 
 ![Factor graph example](dock_fuser_factor_graph.svg)
 
-One tag, three keyframes during an approach. `X_0` and `X_2` see tag a; `X_1` is a fixed-tick keyframe with no tag in view.
+One tag, three keyframes during an approach. `X_0` and `X_2` see tag a; `X_1` is a detector message with no tag in view.
 
 Circles are variables (solved for); squares are factors (measurements or priors on the variables they connect to).
 
@@ -152,8 +142,6 @@ Circles are variables (solved for); squares are factors (measurements or priors 
 | `T_a` (green) | variable | | Tag a's pose on the station, relative to `S`. Stays at its URDF value while only one tag is seen. |
 | `EKF init` (black) | factor | `X_0` | `X_0 = E_0`, very tight. Added once; ties the graph to `odom`. |
 | `odom` (blue) | factor | `X_{k-1}`, `X_k` | EKF motion `E_{k-1}⁻¹E_k` (relative only, since x, y, yaw drift). Huber. |
-| `roll/pitch` (purple) | factor | `X_k` | Roll and pitch from the EKF (gravity); yaw free. Every keyframe. |
-| `depth` (pink) | factor | `X_k` | Depth from the EKF (pressure): `X_k.z − E_k.z`. Every keyframe. |
 | `proj` (red) | factor | `X_k`, `S`, `T_a` | One tag sighting: 4 observed corner pixels vs. corners predicted from `S · T_a` seen by the camera at `X_k · T_bc`. 1 px, Huber. |
 | `URDF` (green) | factor | `T_a` | Keeps `T_a` near its station-URDF pose; σ = mounting tolerance. Added once. |
 
@@ -163,16 +151,42 @@ How to read it:
 
 - Every tag observation is one red square with three edges. All of them meet at `S`, which is how observations from different keyframes combine into one station estimate.
 - The two observations are linked through the `odom` chain `X_0 – X_1 – X_2`. This is what makes single-tag initialization over several frames work (§7): the odometry says how the camera moved between the two views, and the static `S` must explain both.
-- `X_1` has no projection factor. Its pose comes from odometry, roll/pitch and depth alone, and `S` keeps the value the observations gave it.
+- `X_1` has no projection factor. Its pose comes from odometry alone, and `S` keeps the value the observations gave it.
 - With a single tag, its mounting error cannot be separated from the station pose: `S` absorbs it, and `T_a` stays at its prior. The dock point estimate is then only as accurate as that tag's URDF mounting. Additional tags work the same way: each one adds its own `T_j` with a URDF prior and its own projection factors, all meeting at the same `S`.
 
 Source: [dock_fuser_factor_graph.dot](dock_fuser_factor_graph.dot). Re-render with `neato -n2 -Tsvg docs/dock_fuser_factor_graph.dot -o docs/dock_fuser_factor_graph.svg`.
 
+### The real graph on the tank run
+
+`tools/plot_graph.py` replays a bag and draws the factors the estimator actually inserted, for a few seconds at a time (the whole 30–420 s run has ~1900 poses at 5 Hz). Top: structure, with `X_k` along a time axis and `S`, `T_j` above. Bottom: the same graph in space. Tank run 2026-09-16 16:16:47, replayed from 30 s with `tank_dock_fuser.yaml` (tag 146, `cam_front`). The bag's detector ran at 15 Hz; the figures use `--frame-stride 3`, i.e. every 3rd image, which is what the vehicle's 5 Hz detector sees. One keyframe per detector message, so the poses are evenly spaced at 0.2 s.
+
+**Overview, 30–420 s.** Where the two windows below come from. Top: the EKF (grey dashed) and the graph's real-time track (blue; thick where the keyframe has tag factors), the final station and tag, and a box around each window with its own segment highlighted (the track passes near B several times). Bottom: the drift correction `|X_k − E_k|` over time, which grows to ~0.46 m by 420 s, a raster of keyframes with tag factors, and the windows shaded.
+
+![Whole run with the two windows](dock_fuser_graph_overview.png)
+
+**A: initialization, 91.5–96.5 s.** Before 94.4 s the station does not exist: tag frames are buffered, and the graph holds only the `X` chain (orange band); white circles are detector messages without a tag. At 94.4 s the vote and batch solve succeed, and `S`, `T_146` and the 5 buffered observations of the last ~2.6 s (orange) enter the graph in one update. From then on, each tag adds its projection factor at its own keyframe (red).
+
+![Factor graph around initialization](dock_fuser_graph_init.png)
+
+**B: blind gap, 228.5–232.5 s.** Tags in view, then 1.6 s with none: the detector keeps publishing (empty messages), so keyframes continue at 5 Hz with odometry only (white). When the tag returns, its factors resume on the first frame. The bottom panel shows the drift correction: the graph poses (blue) sit ~0.2 m from the EKF (grey dashed).
+
+![Factor graph across a blind gap](dock_fuser_graph_gap.png)
+
+Re-create (detection bag `tank_test_09_16_26_161647_detections`):
+
+```bash
+P="ros2 run race_auv_factorgraph plot_graph <detection bag> --config config/tank_dock_fuser.yaml --start 30 --frame-stride 3"
+$P --overview 420 --window 91.5 96.5 --window 228.5 232.5 --out docs/dock_fuser_graph_overview.png
+$P --window 91.5 96.5 --label A --out docs/dock_fuser_graph_init.png
+$P --window 228.5 232.5 --label B --out docs/dock_fuser_graph_gap.png
+```
+
 Notes:
 
-- **Why the EKF init prior is needed.** Odometry and projection factors only constrain poses relative to each other. Without it, the whole graph (every `X_k` together with `S`) could slide or rotate in x, y and yaw without changing any residual. Roll/pitch and depth priors already fix roll, pitch and z. It pins `X_0` to the EKF's first pose, which makes the graph frame equal to `odom`. It is the only factor that ties the graph to `odom`, and it is added once.
-- **Why relative odometry plus absolute roll/pitch and depth.** The EKF's x, y and yaw drift, so they enter only as relative motion. Roll, pitch (gravity) and depth (pressure) do not drift, so they enter as absolute priors. Without them, noisy far-range corners can tilt `X_k` to fit the pixels.
+- **Why the EKF init prior is needed.** Odometry and projection factors only constrain poses relative to each other. Without it, the whole graph (every `X_k` together with `S`) could move rigidly in all 6 DoF without changing any residual. It pins `X_0` to the EKF's first pose, which makes the graph frame equal to `odom`. It is the only factor that ties the graph to `odom`, and it is added once. When `X_0` leaves the fixed-lag window, the smoother keeps it as a marginal prior on the remaining variables.
+- **Why no absolute roll/pitch or depth factors.** The EKF's roll, pitch (IMU gravity) and depth (pressure) do not drift, but they reach the graph only through the relative odometry chain. Earlier versions also added them as absolute priors on every `X_k` (`Pose3AttitudeFactor`, depth `CustomFactor`). An ablation on the tank run (30–420 s) and on synthetic approaches with EKF noise showed no measurable effect on the docking pose `X_k⁻¹ · S`: it is a relative quantity, and the tags measure it directly. What they did fix was the absolute tilt and depth of `S` in odom (station tilt 0.26° vs 0.8° without; synthetic station z error ~1.4 vs ~5 cm), at the cost of update time (tank p95 51 ms with both vs 3.5 ms without). They were removed to keep the graph lean. They belong back once the EKF is replaced by IMU/DVL preintegration and a pressure factor, where gravity and depth enter natively. Note: on the tank run, the depth prior disagreed with the tags by ~7 cm, consistent with the pressure sensor's `fluid_density: 1022` (seawater) in fresh water.
 - **Odometry noise.** `σ² = q_t·Δt + q_d·Δd` per axis, so the total uncertainty over an interval does not depend on the keyframe rate. The Huber kernel lets tags win a disagreement with the odometry.
+- **DVL dropouts** (`core/frontend/dvl_monitor.py`, node parameter `dvl_topic`, `estimator.dvl_*`). `robot_localization` fuses IMU, DVL velocity and depth, with no position input. The DVL driver publishes `bottom_lock_velocity_common` only while it has bottom lock, so a dropout is a silence on that topic. During it the EKF dead-reckons on the IMU and its position drifts; when the DVL returns, the Kalman update's velocity innovation also corrects the position, through the position–velocity correlation built up during the dropout, in one step: the EKF **snaps** back by about the drift. Tank test 16:16:47: every EKF step over 10 cm comes 0.01–0.04 s after the first DVL message that ends a silence, and is at most about 0.1 m/s × the silence length (11.2 s → 1.05 m, 4.8 s → 14 cm, 3.6 s → 14 cm). So the fuser subscribes to the DVL topic (stamps only) and adds translation σ to the odometry factor: `dvl_blind_speed` (0.1 m/s) × the step's blind time inside a silence (the drift), and `dvl_blind_speed` × the silence length on the step that contains the re-lock (the snap). With tags in view the tags then decide; without tags nothing competes with the odometry, so the graph follows the EKF's mean motion, snap included. Synthetic 6 s dropout (0.57 m drift and snap) with tags in view, 5 seeds, docking-pose error: median / p95 / max 2.5 / 10.9 / 14.9 cm with the DVL monitor, 4.4 / 14.5 / 17.0 cm with the earlier speed-based jump detector (`EKF step > 1 m/s` → σ = step size; it only caught the snap, not the drift), 2.8 / 14.7 / 17.8 cm with neither. The jump detector added nothing on top of the DVL monitor, so it was removed. On the tank run none of the 7 dropouts had a tag in view during it or in the 10 s after, so it shows no difference either way.
 - **One factor per tag.** Grouping the four corners into one 8-row `CustomFactor` keeps the four corners rigid and makes 4× fewer Python callbacks than one factor per corner.
 - **Jacobians.** Chain them from `Pose3.compose`, `Pose3.transformFrom` / `transformTo` and the pinhole projection, all of which return Jacobians in the Python bindings. Every `CustomFactor` gets a finite-difference unit test.
 
@@ -180,17 +194,33 @@ Notes:
 
 ## 6. Per-keyframe cycle
 
-A keyframe is created at every camera frame that carries tag detections, and on a fixed tick (5 Hz) otherwise.
+One keyframe per detector message, at its image stamp. The tag detector (`tag_detector_node`) runs on a fixed timer (`publish_rate`, 5 Hz on the vehicle) and publishes every processed image, with or without tags, so the detector is the graph's clock: a message with tags gives a keyframe with projection factors, an empty one a keyframe with odometry only.
 
-1. **Stamp.** Take the camera stamp t (or the tick). Interpolate `E(t)` from the EKF buffer; if t is newer than the newest EKF message, wait one EKF period.
+1. **Stamp.** Take the message's `header.stamp` t (the image capture time). Wait until the EKF buffer holds a pose stamped at or after t, then interpolate `E(t)`.
 2. **Create `X_k`.** Initial value `X̂_k = X_{k-1} · (E_{k-1}⁻¹ E_k)`.
-3. **Motion factors.** Add odometry, roll/pitch and depth.
+3. **Motion factor.** Add odometry.
 4. **Tag factors.**
-   - Before `S` exists: buffer the detections and run initialization (§7).
-   - In TRACKING: pre-filter detections, run the gates (§8), and add a projection factor for each accepted tag. A tag seen for the first time gets a new `T_j` with its URDF prior.
-5. **Update iSAM2** with the new factors and values.
+   - Every detection of a station tag is used (§8: the detector already checked it; no gate in the fuser).
+   - Before `S` exists: buffer the accepted detections and run initialization (§7).
+   - In TRACKING: add a projection factor for each accepted tag. A tag seen for the first time gets a new `T_j` with its URDF prior. If the tag-implied pose fits better than the odometry prediction `X̂_k` and is farther from it than 5 cm plus its PnP range noise, `X_k` starts there instead (§8).
+5. **Update the smoother** with the new factors and values.
 6. **Read back** `X_k`, `S` and the `T_j`.
 7. **Publish** (§10).
+
+**Scheduling** (`core/frontend/scheduler.py`, shared by the node, the bag replay and the synthetic runs):
+
+- Every detector message is queued; frames are released strictly in stamp order once the EKF covers them. There is no extrapolation and no separate keyframe timer. The node runs the scheduler from both callbacks, so a frame is processed the moment its covering EKF message arrives.
+- A frame whose stamp is not newer than the previous one is dropped (`frames_dropped`): a re-published image, or an out-of-order message. The detector itself skips a timer tick when no new image has arrived, so this is only a guard.
+- If the EKF stream stops, at most 50 frames (10 s) wait; the oldest fall out.
+- **One camera.** A single detector's stamps only increase, so no reordering is needed. `build_setup` refuses a config with more than one camera: a second, unsynchronized camera would interleave its frames with the first, and each late arrival would be dropped. Supporting it needs a reordering step (hold a frame until every camera has reported a later stamp).
+- **Detector rate.** At 5 Hz the fixed-lag window holds ~150 poses. Odometry-only poses are the expensive ones to marginalize (iSAM2 re-eliminates much of the tree for them; ~0.5 ms for a pose with a tag factor vs ~7 ms at 150 poses and ~25 ms at 450 poses, desktop), so update time grows with the detector rate. Tank run at 5 Hz: update median 0.6 ms, p95 7.6 ms, max ~20 ms, the same as the earlier tag-frames-plus-5 Hz-tick scheduler at that rate, with identical docking-pose accuracy.
+
+**Timing across machines.** On the vehicle, the EKF runs on the front-seat computer and the camera, detector and estimator on the Jetson; messages cross over zenoh. Only header stamps are used, never arrival times, so transport latency and jitter do not shift a keyframe: a late EKF message only makes the frame wait. Two things stamps cannot fix:
+
+- **Clock offset between the computers.** A 50 ms offset places every `X_k` 50 ms off along the trajectory (1–2.5 cm at docking speeds). Synchronize the clocks (chrony or PTP). `/diagnostics` reports `ekf_age_s` (local receive time − EKF stamp): normally a few ms of zenoh latency; negative or large means the clocks disagree. `frame_age_s` is the same for the detector, i.e. its latency.
+- **Image stamps.** The camera driver must stamp images with the capture time. Stamping on arrival at the Jetson delays every keyframe by a constant offset that no synchronization can remove.
+
+There is no `message_filters` synchronizer: it would pair a frame with the *nearest* EKF message (up to half an EKF period away) and drop unmatched messages. Interpolating `E` at the exact image stamp is more accurate and loses nothing. `/diagnostics` goes to WARN if no detector or EKF message has arrived for 1 s (no detector messages means no new keyframes).
 
 ---
 
@@ -247,31 +277,30 @@ Running PnP with the corners expressed directly in the `dock_point` frame (as be
 
 ### 7.1 Per-frame hypotheses
 
-For each buffered tag frame that passes gate 1 (§8):
+For each buffered tag frame:
 
 1. Run PnP on the corners, expressed in the `dock_point` frame:
    - **Single tag:** `cv2.SOLVEPNP_IPPE_SQUARE` returns both planar solutions.
-   - **Several tags:** `cv2.SOLVEPNP_SQPNP` over all corners gives one solution. Run gate 2 first.
+   - **Several tags:** `cv2.SOLVEPNP_SQPNP` over all corners gives one solution.
 2. Turn each PnP solution into a station hypothesis: `S_h = X̂_k · T_bc · T_C_dock`.
 3. Prune hypotheses using information the single frame already has:
-   - **Reprojection ratio.** If the better solution's reprojection error is below 0.3 × the other's, the frame is unambiguous: keep only the better one. Otherwise keep both.
-   - **Station tilt.** Roll and pitch of `X̂_k` are absolute (gravity, from the EKF), so each hypothesis implies a station roll and pitch in `odom`. Drop a hypothesis whose station tilt exceeds what the seabed allows (for example 15°). A flipped solution tilts the tag plane, so it usually implies a visibly tilted station. This check often resolves the flip from one frame.
+   - **Reprojection ratio.** If the better solution's reprojection error is below 0.3 × the other's, the frame is unambiguous: keep only the better one. Otherwise keep both; voting (§7.2) and the batch solve (§7.3) resolve the flip. (An earlier station-tilt check, which dropped hypotheses implying a station tilted more than 15°, was removed: on the tank run and 15 synthetic runs it changed no initialization.)
 
 ### 7.2 Multi-frame voting
 
-Collect the surviving hypotheses over a sliding window (for example up to 3 s, or 5–10 tag frames). Each frame votes for at most one of its hypotheses. Find the station pose supported by the most frames within a tolerance of a few cm and a few degrees.
+Collect the surviving hypotheses over a sliding window (default 3 s / 15 frames). Each frame votes for at most one of its hypotheses. Find the station pose supported by the most frames within tolerance. Both tolerances grow with range, because single-tag PnP noise does: translation `max(10 cm, 5 % of range)`, rotation `max(5°, 1.5°/m × range)`. At 6 m a 12 cm tag is about 18 px wide, and its PnP rotation is good to only several degrees. A fixed 5° tolerance split the true cluster and initialization stalled.
 
 Move to the batch solve when:
 
-- the winner is supported by at least N frames (for example 5),
+- the winner is supported by at least N frames (default 5),
 - the supporting frames have **viewpoint diversity**: the viewing direction to the tag changes by at least a few degrees, or the camera moves laterally by at least a few cm. Without this, extra frames only average noise and cannot separate the flip.
-- any competing cluster has clearly fewer votes.
+- the winner is not outvoted by a competing cluster (`init_max_competitor_ratio`, default 1.0). Far away, the true and the flipped clusters often tie on votes. The batch solve, which scores both against every corner in the window, is the deciding test. Lower the ratio to also demand a vote margin.
 
 ### 7.3 Batch solve
 
 Build a small graph from the window:
 
-- the `X_k` of the buffered frames, held near their current estimates by loose priors, plus the odometry, roll/pitch and depth factors between them,
+- the `X_k` of the buffered frames, held near their current estimates by loose priors, plus the odometry factors between them,
 - `S`, initialized to the winning hypothesis,
 - `T_j` for each tag seen in the window, with its URDF prior,
 - projection factors for every buffered detection.
@@ -283,44 +312,64 @@ Accept when:
 - the maximum whitened residual is below a threshold, and
 - the competing solution, if any, ends with a clearly higher error (for example ≥ 2×).
 
-**On accept:** insert `S`, the `T_j`, the URDF priors and **all** buffered projection factors into iSAM2 (the `X_k` already exist there), and switch to TRACKING.
+**On accept:** insert `S`, the `T_j`, the URDF priors and **all** buffered projection factors into the smoother (the `X_k` already exist there), and switch to TRACKING.
 
 **On reject:** drop the oldest frames and keep collecting.
 
 ### 7.4 After initialization
 
-- A station initialized from one tag can still be loose, mostly in range and in rotation about the tag's vertical axis. For a short period after initialization (for example 5 s), use a looser threshold for gate 3.
-- New tags enter through the normal tracking path. Each one gets a `T_j` initialized from `S · T_j^URDF` with its URDF prior, and its observations pass the usual gates. Every additional tag tightens `S`.
+- A station initialized from one tag can still be loose, mostly in range and in rotation about the tag's vertical axis. Nothing compares new detections with the estimate, so a loose `S` never causes rejections; the following observations tighten it.
+- New tags enter through the normal tracking path. Each one gets a `T_j` initialized from `S · T_j^URDF` with its URDF prior, and its observations are used like any other. Every additional tag tightens `S`.
 - With the fixed-lag backend, the init window must be shorter than the lag so the buffered `X_k` still exist when the factors are inserted.
 
 ---
 
-## 8. Tag gating
+## 8. Which detections are used
 
-Gates run from cheapest to most expensive. A tag that fails any gate is dropped for that frame only.
+There is **no gate in the fuser**. Every detection of a station tag becomes a projection factor (before initialization: a buffered frame for the vote). Three things stand between a bad detection and the estimate:
 
-1. **Pre-filter.** Minimum tag area, minimum viewing angle, minimum distance from the image border, and all four corners in front of the camera at the predicted pose. A factor whose corners fall behind the camera must never be added.
-2. **Multi-tag consistency.** With two or more tags in one frame, compare their relative poses from PnP with the URDF. Drop a tag that disagrees with the others. This check uses no odometry.
-3. **Predicted reprojection.** Project the tag's corners from `X̂_k`, `S` and `T_j`. Reject if the RMS error exceeds a few pixels.
-4. **Local solve.** Build a small graph from the new factors plus tight priors holding the current estimates, run a few Levenberg–Marquardt iterations, and admit the factors only if the maximum whitened error is below a threshold. The initialization batch solve (§7.3) is this gate applied to a whole window; in steady tracking gate 3 is usually enough. (This is TagSLAM's subgraph-initialization idea.)
+**1. Image checks in the tag detector** (`race_auv_camera_tag_factorgraph/tags.py`), before the corners are published. They are properties of one detection in one image, so they belong at the source:
 
-The flip ambiguity matters only when a pose is initialized from PnP (§7). In TRACKING, tag factors are linearized at the graph's own estimate of `X_k`, `S` and `T_j`, never at a PnP solution, so a flipped detection cannot enter directly. If it disagrees with the estimate, gate 3 rejects it.
+- every corner at least `min_edge_px` (10 px) from the edge of the rectified image;
+- shortest tag side at least `min_side_px` (15 px);
+- PnP fit: the RMS error of the best planar-square fit (IPPE) at most `max_fit_rms_px` (1.5 px). It catches quads that are not a clean square in perspective: occlusion, blur, a misplaced corner. The pose absorbs most of a single bad corner (6 parameters for 8 coordinates), so this only catches gross errors (one corner off by about 10 px or more).
+
+On the tank run they reject 139 detections at the border and 71 for PnP fit (the close-range ones) out of ~3800. Bags recorded with the legacy detector carry corners that were only border-checked; re-run them through the new detector (`bag_test.launch.py`) rather than feeding them to the fuser directly.
+
+**2. The initialization vote** (§7): the station pose comes from hypotheses that several frames must agree on, so a lone bad frame does not set `S`.
+
+**3. The Huber kernel** on the projection factor (`tag_huber_k` = 2σ) bounds the pull of a bad detection that is left. It down-weights, it does not reject.
+
+In the fuser, a detection is only dropped when its tag is not on the station or PnP fails on it (`DockEstimator._usable_detections`).
+
+**Why the temporal-consistency gate was removed.** Earlier versions accepted a detection only when 3 frames within 0.7 s put the tag in the same place (EKF frame). Measured:
+
+| | gate | no gate (Huber only) |
+|---|---|---|
+| Tank run 30–420 s, 5 Hz: tag factors | 1161 | 1213 |
+| tracking from | 97.2 s | 94.2 s |
+| docking pose vs LM, median / p95 / max | 0.25 / 1.38 / 13.9 cm | 0.25 / 1.44 / 8.8 cm |
+| Synthetic, 10 % single ghost frames (correct ID, corners shifted 120 px): p95 / max | 8.4 / 46 cm | 45 / 78 cm |
+| Synthetic, 1 s ghost bursts every 5 s: p95 / max | 55 / 168 cm | 51 / 83 cm |
+
+On real data it only delayed tags (each new sighting streak held 0.4 s); it helped against isolated wrong-but-clean detections, which the data does not contain, and it could not stop persistent ones (a ghost lasting a few frames is consistent with itself). Its tolerances were heuristics (a 2 px size error model ignoring viewing angle, a 4 cm EKF term, a window tied to the detector rate), and remembering positions across gaps is unsafe: in the EKF frame the static tag "moves" up to 3.6 cm/s across gaps and 1.5 m across the DVL dropout. If wrong-but-clean detections show up on the vehicle (reflections, a duplicate ID), the candidates are a covariance-based consistency test (tolerance from `sigma_px` through the PnP Jacobian) or a redescending kernel once tracking is established, evaluated with the same synthetic ghosts.
+
+**Initial value of X_k.** `X̂_k` chains the EKF motion from the previous keyframe, so after drift it can be far from the truth. The smoother linearizes a new variable at its initial value. Starting far away costs iterations and, at close range, can put corners behind the camera. Each tag proposes a pose. The best-fitting proposal becomes the starting point if it fits the tags better than `X̂_k` and lies farther from it than its own uncertainty, `seed_min_shift + range · gate_size_tol_px / side_px` (5 cm plus the proposal's PnP range noise, the same model as the consistency gate). It is reported as `seeded_from_tag`. The threshold is a distance, not pixels: at 0.3 m range, 3 mm is already 10 px. A 5 px threshold fired on 740 tank keyframes, 666 of them for sub-centimetre differences. The proposal keeps `X̂_k`'s orientation and solves only the translation that puts the tag centre where the camera measured it: `t = p_tag − R_X̂ (R_bc p_ct + t_bc)`. Inverting the full PnP pose would multiply its rotation error by the range. This changes only where the optimizer starts, never which measurements are used.
+
+**Flip ambiguity.** It matters only when a pose is initialized from PnP (§7). The projection factors use corner pixels and are linearized at the graph's estimate, never at a PnP solution.
 
 ---
 
 ## 9. Backend
 
-The backend is iSAM2, wrapped so the variant is a single setting:
+The backend is always `gtsam.IncrementalFixedLagSmoother`: iSAM2 plus marginalization of every variable older than `smoother_lag` (default 30 s). The graph stays bounded, so the cost per keyframe stays flat on a long run (`core/backend/smoother.py`).
 
-| | `gtsam.ISAM2` | `gtsam.IncrementalFixedLagSmoother` |
-|---|---|---|
-| What it is | Plain iSAM2 | The same iSAM2, plus marginalization of variables older than the lag |
-| Graph size | Grows with time | Bounded by the lag (e.g. 30 s) |
-| Use for | Development, offline bag replay, short runs | Long runs on the vehicle |
+Plain iSAM2 is not offered. Every tag factor is attached to the single station variable `S`, and each relinearization of `S` re-evaluates all of them. With a graph that grows forever that reached several seconds per keyframe on a 25-minute tank run. Post-processing does not need an incremental solver: the backend keeps a copy of every factor it receives, and `batch_lm` re-optimizes that full graph at once with Levenberg–Marquardt (§13).
 
 Fixed-lag specifics:
 
 - The smoother treats the newest timestamp as "now". Re-stamp `S` and every `T_j` with the current time on each update so they are never marginalized. Do not give them a far-future timestamp: that marginalizes everything else immediately.
+- Keep the lag well above the initialization window and the first seconds of tracking. Marginalization freezes the linearization point, so a short lag turns the station's early, still-loose estimate into a biased prior. Synthetic approach: a 5 s lag gave 0.6 cm final error versus 0.15 cm at 10 s and 30 s (the same as plain iSAM2).
 
 Error handling:
 
@@ -333,10 +382,14 @@ Error handling:
 | Output | Value | Rate |
 |---|---|---|
 | TF `odom → station base_link` | `E_k · X_k⁻¹ · S · T_dock_base`, where `T_dock_base` is the inverse of the station URDF `dock_point_joint` origin | EKF rate (holds the last value between solves) |
-| `/dock_point/pose` | `X_k⁻¹ · S` in `base_link`, with the marginal covariance of `S` | each keyframe |
-| Diagnostics | station state, tags accepted / rejected, update time, residuals per factor type | each keyframe |
+| TF `station base_link → dock_point` (static, `publish_station_static_tf`) | station URDF `dock_point_joint` | once |
+| `/dock_point/pose` (`PoseWithCovarianceStamped`) | `X_k⁻¹ · S` in `base_link`, with the covariance of that relative pose | each keyframe |
+| `/diagnostics` | station state, tags accepted / rejected and why, update time, init progress, drift correction | 1 Hz |
+| `~/auv_pose`, `~/station_pose`, `~/keyframe` (`publish_debug`) | `X_k` and `S` in odom, and a JSON record per keyframe | each keyframe |
 
-The station's own `robot_state_publisher` hangs `dock_point` and the tag frames below its `base_link`, so they appear in RViz without extra code.
+The station's own `robot_state_publisher` hangs `dock_point` and the tag frames below its `base_link`. It is not part of the AUV bringup, so the node can publish `base_link → dock_point` itself.
+
+**Covariance of `/dock_point/pose`** (`covariance_mode`). The marginal covariance of `S` alone is expressed in `odom`, so it contains all the odometry uncertainty accumulated since `X_0`. That is irrelevant for docking, and it overstated the docking uncertainty about 3×. The default `relative` mode publishes the covariance of `X_k⁻¹ · S`: with the joint marginal `C` of `(X_k, S)` and the Jacobians `H1`, `H2` of `between(X_k, S)`, it is `[H1 H2] C [H1 H2]ᵀ`. The Python bindings expose no joint marginal for the smoother, so this runs `gtsam.Marginals` on the smoother's graph (~15 ms at ~800 factors). It is refreshed at most once per `covariance_period` (1 s) and reused in between. With one tag it is dominated by the URDF mounting prior: 2° of mounting uncertainty is about 2 cm at the dock point 0.5 m away.
 
 **Why `E_k · X_k⁻¹ · S` and not just `S`.** The EKF keeps publishing `odom → base_link = E_k`, which drifts. The graph's corrected AUV pose is `X_k`, and its station is `S`. The TF tree composes `odom → base_link` with `odom → station`, so `base_link → station = E_k⁻¹ · (odom → station)`. Publishing `E_k · X_k⁻¹ · S` makes that equal `X_k⁻¹ · S`, the graph's corrected relative pose. Publishing `S` alone would give `E_k⁻¹ · S`, which mixes the drifted EKF pose with the graph's station and is wrong whenever `X_k ≠ E_k`. This is the same role `map → odom` plays in REP-105: the edge absorbs the drift correction, so it moves slowly as drift accumulates even though the station itself is static.
 
@@ -346,30 +399,57 @@ Corrections to `odom → station` are rate-limited (interpolated toward the new 
 
 ## 11. Code layout
 
-The `dock_fuser` ament_python package in this repo:
+The `race_auv_factorgraph` ament_python package in this repo. The node is `dock_fuser` (executable `dock_fuser_node`).
 
 ```
-dock_fuser/
+race_auv_factorgraph/          # repo root = the ROS package
   package.xml, setup.py, setup.cfg
+  docs/                        # this design doc, example factor graph
   config/
-    dock_fuser.yaml       # cameras and K_C (§3), noise parameters
-  dock_fuser/
-    core/                 # pure Python + gtsam, no ROS imports
-      keys.py             # symbol helpers, timestamp bookkeeping
-      factors.py          # tag projection (8-row), depth
-      odometry.py         # relative motion and its noise
-      init.py             # PnP hypotheses, ratio and tilt pruning, multi-frame voting, batch solve
-      gating.py           # gates 1–4
-      station.py          # NO_STATION / CANDIDATE / TRACKING, detection buffer
-      estimator.py        # owns the backend, runs the per-keyframe cycle
+    dock_fuser_sim.yaml        # Stonefish: cam_front, 5 tags
+                               # (vehicle config: race_auv_bringup/config/dock_fuser.yaml)
+    tank_dock_fuser.yaml       # tank-test bag replay: cam_front, tag 146
+    tank_tag_detector.yaml     # tag_detector_node params for the tank-test bag replay
+  launch/
+    dock_fuser.launch.py       # the node with a config
+    bag_test.launch.py         # bag window -> detector -> dock_fuser -> recorded bag
+  race_auv_factorgraph/
+    core/                      # pure Python + gtsam, no ROS imports
+      common/                  # leaf layer, no graph logic
+        config.py              # EstimatorConfig: every tuning knob, documented
+        model.py               # CameraModel, TagModel, Detection, TagFrame, corner order
+        geometry.py            # Pose3 helpers, Jacobian buffers, covariance conversion
+        urdf.py                # joint-origin URDF reader (T_bc, tag poses)
+        keys.py                # symbol helpers, timestamp bookkeeping
+      factors/                 # §5
+        projection.py          # tag projection (8-row CustomFactor)
+        odometry.py            # relative motion and its random-walk noise
+        priors.py              # EKF anchor, tag URDF and recovery priors
+        noise.py               # Huber / diagonal-sigma helpers
+      frontend/                # §6, §8
+        pose_buffer.py         # EKF pose buffer with interpolation
+        scheduler.py           # one keyframe per detector message (shared by node, replay, synthetic)
+        pnp.py                 # IPPE / SQPNP helpers
+      init/                    # §7
+        solver.py              # hypotheses, ratio test, voting, batch solve
+        state_machine.py       # NO_STATION / CANDIDATE / TRACKING, detection buffer
+      backend/                 # §9, §10
+        smoother.py            # fixed-lag smoother wrapper, marginals
+        estimator.py           # owns the backend, runs the per-keyframe cycle
     ros/
-      node.py             # subscriptions, EKF buffer and interpolation, params, TF and pose output
+      params.py                # parameter defaults + model construction (node and replay)
+      node.py                  # subscriptions, TF and pose output, diagnostics, debug topics
     tools/
-      replay_bag.py       # bag → core estimator, offline and deterministic
-      evaluate.py         # error vs sim truth, leave-one-tag-out, held-out frames
+      synthetic.py             # synthetic approach (tests, demo: synthetic_demo)
+      replay_bag.py            # bag -> core estimator, offline and deterministic
+      evaluate.py              # error vs sim truth, held-out frames, leave-one-tag-out
+      plot_bev.py              # BEV plot of a bag_test run
+      plot_graph.py            # the real factor graph over a short window; whole-run overview
   test/
-    test_jacobians.py     # finite-difference check for every CustomFactor
-    test_scenarios.py     # synthetic: clean approach, single tag, tags lost and reacquired
+    test_jacobians.py          # finite-difference check for every CustomFactor
+    test_scenarios.py          # synthetic end-to-end scenarios
+    test_units.py              # geometry, URDF, buffer, scheduler, PnP
+    test_imports.py            # every module imports
 ```
 
 `core/` has no ROS dependency, so the same code runs live in the node, offline on bags, and in unit tests.
@@ -378,10 +458,12 @@ dock_fuser/
 
 ## 12. Build order
 
-1. `factors.py` and `test_jacobians.py`.
-2. `estimator.py` with odometry, roll/pitch and depth only, plus `replay_bag.py`. Check that `odom → station` stays fixed and `X_k` tracks the EKF.
-3. Tag factors, gates 1–3, and single-tag multi-frame initialization (`init.py`, NO_STATION → CANDIDATE → TRACKING). Validate in simulation against Stonefish ground truth, including approaches where only one tag is visible for a long time.
-4. Gate 4 and error recovery.
+Status: steps 1–5 are implemented. The synthetic tests and a live node test pass. Remaining: profiling on the vehicle computer and choosing the backend there.
+
+1. `core/factors/` and `test_jacobians.py`.
+2. `estimator.py` with odometry only, plus `replay_bag.py`. Check that `odom → station` stays fixed and `X_k` tracks the EKF.
+3. Tag factors and single-tag multi-frame initialization (`core/init/`, NO_STATION → CANDIDATE → TRACKING). Validate in simulation against Stonefish ground truth, including approaches where only one tag is visible for a long time.
+4. Error recovery.
 5. `node.py`, then profile on the vehicle computer and choose the backend variant.
 
 ---
@@ -395,12 +477,13 @@ A residual on detections the graph was fitted to measures self-consistency, not 
 - **Held-out frames:** withhold every Nth tag frame and report its reprojection error.
 - **Mounting residuals:** whitened residuals of the tag URDF priors above 3 flag a tag whose real mounting differs from the URDF.
 - **Initialization:** in simulation, record how often a single-tag initialization picks the flipped solution, and how long after the first tag sighting it takes to reach TRACKING.
+- **Real time vs batch** (`tools/batch_lm.py`, `plot_bev --batch`): re-optimize the graph the real-time run built, with the same accepted factors, all at once with Levenberg–Marquardt (full smoothing), and compare. On the tank test (95–250 s, tag 146) the docking pose agreed within ~0.5 cm while the tag was in view, and the real-time error grew to ~11 cm over 20 s blind gaps (EKF drift rate, which smoothing spreads back over the gap). The first version of this comparison also included plain iSAM2, whose final estimate was 1.2 cm median from the LM optimum; it was removed (§9).
 
 ---
 
 ## 14. Relation to TagSLAM
 
-The pipeline uses the same measurement model as TagSLAM (Pfrommer & Daniilidis, 2019) but is narrower in scope and differs in anchoring, priors and initialization.
+The pipeline uses the same measurement model as TagSLAM (B. Pfrommer and K. Daniilidis, "TagSLAM: Robust SLAM with Fiducial Markers", 2019, [arXiv:1910.00679](https://arxiv.org/abs/1910.00679); code [berndpfrommer/tagslam](https://github.com/berndpfrommer/tagslam)) but is narrower in scope and differs in anchoring, priors and initialization.
 
 **Taken from TagSLAM**
 
@@ -410,7 +493,7 @@ The pipeline uses the same measurement model as TagSLAM (Pfrommer & Daniilidis, 
 | Tag pose relative to its body, with optional prior | Tag pose w.r.t. body | `T_j` relative to `S`, with URDF prior |
 | Odometry as a relative pose prior | Relative pose prior between body poses | Odometry factor |
 | Every frame is a keyframe, iSAM2 backend | Yes | Yes |
-| Admit new measurements only after a local solve passes an error threshold | Subgraph optimized non-incrementally, accepted below a threshold | Gate 4 and the initialization batch solve |
+| Admit new measurements only after a local solve passes an error threshold | Subgraph optimized non-incrementally, accepted below a threshold | The initialization batch solve (in tracking, the detector's image checks and Huber, §8) |
 | Use earlier measurements once their variables become solvable | Full graph keeps all measurements; they enter the optimized graph when determinable | Tag frames before `S` exists are buffered and inserted at initialization |
 | Ambiguity test before a tag pose is trusted | Ambiguity error ratio and viewing angle | Reprojection ratio of the two IPPE solutions, at initialization |
 
@@ -420,14 +503,60 @@ The pipeline uses the same measurement model as TagSLAM (Pfrommer & Daniilidis, 
 |---|---|---|
 | Scope | General: any number of static and dynamic bodies, tags and cameras | One station, one AUV |
 | World frame | Anchored by an absolute prior on a static body | `odom`, anchored by `X_0 = E_0`; the station `S` is unknown |
-| Absolute priors on the moving body | None | Roll, pitch and depth from the EKF at every keyframe |
 | Camera extrinsics | Variables (can be calibrated) | Fixed from the URDF |
 | Distortion | Inside the projection factor | Rectified image, plain pinhole, `K_C` from YAML |
 | Noise model | Gaussian | Huber on tag and odometry factors; random-walk odometry noise |
-| Initial pose estimate | Homographies from a minimal set of tags; factor ordering heuristic with retries | PnP hypotheses, tilt pruning, multi-frame voting over an odometry-linked window, batch solve |
-| Graph growth | Full history (option to keep only the last two time steps) | Plain iSAM2 or fixed-lag smoother |
+| Initial pose estimate | Homographies from a minimal set of tags; factor ordering heuristic with retries | PnP hypotheses, ratio test, multi-frame voting over an odometry-linked window, batch solve |
+| Graph growth | Full history (option to keep only the last two time steps) | Fixed-lag smoother (plus batch LM for post-processing) |
 | Output | Body poses in the world frame | `odom → station` TF composed with the EKF, plus `/dock_point/pose` |
 
 **Not included:** multiple moving bodies, extrinsic calibration, distance and coordinate measurement factors, and loop closure over large tag maps.
 
-**Note on PnP.** The TagSLAM paper reports that PnP is not robust when tag poses in the map are wrong, and uses homographies instead. Here tag poses come from the URDF, and the multi-tag consistency gate catches a wrong one. If initialization proves fragile in testing, switch to TagSLAM's homography approach.
+**Note on PnP.** The TagSLAM paper reports that PnP is not robust when tag poses in the map are wrong, and uses homographies instead. Here tag poses come from the URDF, with a mounting prior that lets the graph absorb a few mm / degrees of error. If initialization proves fragile in testing, switch to TagSLAM's homography approach.
+
+---
+
+## 15. Running
+
+```bash
+# Unit + synthetic end-to-end tests
+colcon test --packages-select race_auv_factorgraph && colcon test-result --verbose
+
+# Synthetic approach demo (no ROS graph needed)
+ros2 run race_auv_factorgraph synthetic_demo
+
+# Vehicle: cameras + tag detectors + dock_fuser (race_auv_bringup;
+# vehicle config race_auv_bringup/config/dock_fuser.yaml, verify intrinsics and tags first)
+ros2 launch race_auv_bringup bringup_camera_tag_factorgraph.launch.py
+
+# Live node (simulation config); the detector must publish apriltag_detection/tags
+ros2 launch race_auv_factorgraph dock_fuser.launch.py
+
+# Re-run detection + fuser on a recorded bag window, record the results, plot
+ros2 launch race_auv_factorgraph bag_test.launch.py bag:=<bag dir> start_offset:=95 duration:=155
+ros2 run race_auv_factorgraph plot_bev <output bag> --time-offset 95 [--batch]
+
+# Batch LM post-processing (full smoothing) of the same graph, compared with real time
+ros2 run race_auv_factorgraph batch_lm <output bag> --config <dock_fuser yaml> [--csv out.csv]
+
+# Compare smoother lags against a batch LM reference on one run, using a
+# detection-only pass so every backend sees identical detections
+ros2 launch race_auv_factorgraph bag_test.launch.py bag:=<bag> start_offset:=0 duration:=100000 \
+    run_fuser:=false record_images:=false out:=<detection bag>
+ros2 run race_auv_factorgraph compare_backends <detection bag> --config <dock_fuser yaml> --out <dir> \
+    [--variants fixed_lag:30 fixed_lag:60]
+
+# Draw the factor graph the estimator built over a few seconds of a replay
+ros2 run race_auv_factorgraph plot_graph <detection bag> --config <dock_fuser yaml> --start 30 \
+    --window 91.5 96.5 --frame-stride 3 --out graph.png
+# ... or the whole run with a box around each window
+ros2 run race_auv_factorgraph plot_graph <detection bag> --config <dock_fuser yaml> --start 30 \
+    --frame-stride 3 --overview 420 --window 91.5 96.5 --window 228.5 232.5 --out overview.png
+
+# Deterministic offline re-run of the fuser on a bag that already has the tags topic.
+# --frame-stride 3 replays a 15 Hz detector bag as the vehicle's 5 Hz detector would see it.
+ros2 run race_auv_factorgraph replay_bag <bag> --config <dock_fuser yaml> --out <dir> [--holdout-every 5] [--frame-stride 3]
+ros2 run race_auv_factorgraph evaluate <dir>
+```
+
+Dependencies: ROS 2 Jazzy, `ros-jazzy-apriltag-msgs`, and the gtsam Python bindings (`pip install gtsam`, tested with 4.3a0).

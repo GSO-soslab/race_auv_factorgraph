@@ -1,0 +1,52 @@
+# dock_fuser parameters for the tank-test bag replay (launch/bag_test.launch.py).
+# Front camera only, tag 146 only, fixed-lag smoother, debug topics on for tools/plot_bev.py.
+dock_fuser:
+  ros__parameters:
+    odom_topic: /race_auv/odometry/filtered     # recorded EKF output
+    # DVL bottom-lock velocity, published only while the DVL has bottom lock.
+    # A silence = the EKF dead-reckons (drifts), then snaps back when the DVL
+    # returns; those odometry steps are de-weighted (estimator.dvl_*).
+    # "" disables it.
+    dvl_topic: /race_auv/nucleus_node/bottom_lock_velocity_common
+    graph_frame: race_auv/odom
+    base_frame: race_auv/base_link
+    station_base_frame: race_station/base_link
+    dock_frame: race_station/dock_point
+    publish_station_static_tf: true
+    dock_pose_topic: /race_auv/dock_point/pose
+    publish_debug: true
+
+    auv_urdf_package: race_auv_description
+    auv_urdf_file: urdf/base.urdf
+    station_urdf_package: race_station_description
+    station_urdf_file: urdf/base.urdf
+
+    tag_family: "36h11"
+    tag_ids:   [146]
+    tag_sizes: [0.12]                           # black square
+
+    # One keyframe per detector message (the tank bags: 15 Hz detector).
+    camera_names: [cam_front]
+    cameras:
+      cam_front:
+        detections_topic: /cam_front/apriltag_detection/tags
+        frame: race_auv/cam_front
+        # RECTIFIED camera matrix produced by the detector's rectifier from the
+        # underwater fisheye calibration (stellar_cam.yaml, balance 0, crop).
+        # Must match the detector's "Rectifier ready: ..." log line.
+        fx: 1165.2372
+        fy: 1164.9232
+        cx: 801.9339
+        cy: 679.6697
+        width: 1600
+        height: 1200
+
+    estimator:
+      # DVL dropout handling (core/frontend/dvl_monitor.py). Extra odometry
+      # translation sigma: dvl_blind_speed * blind time per step, and
+      # dvl_blind_speed * silence length on the re-lock (snap) step.
+      dvl_timeout: 0.5          # s without a DVL message = bottom lock lost (DVL at 5 Hz)
+      dvl_blind_speed: 0.1      # m/s; tank: EKF snaps <= ~0.1 m/s * silence (11.2 s -> 1.05 m)
+      dvl_relock_margin: 0.3    # s after re-lock still counted as the snap
+      smoother_lag: 30.0
+      covariance_mode: relative

@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.ros.org/wiki/package_format3/Description"?>
+<package format="3">
+  <name>race_auv_factorgraph</name>
+  <version>0.1.0</version>
+  <description>
+    gtsam iSAM2 factor graph (node: dock_fuser) that estimates the docking
+    station pose from AprilTag corner detections and the robot_localization
+    EKF odometry. Design: docs/DOCK_FUSER_PIPELINE.md.
+    The gtsam Python bindings (>= 4.2, `import gtsam`) are not a rosdep key:
+    install them with `pip install gtsam`.
+  </description>
+  <maintainer email="dev@example.com">dev</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>apriltag_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>race_auv_description</exec_depend>
+  <exec_depend>race_station_description</exec_depend>
+  <exec_depend>race_auv_camera_tag_factorgraph</exec_depend>  <!-- tag detector, launch/bag_test.launch.py -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <!-- offline tools (tools/replay_bag.py) -->
+  <exec_depend>rosbag2_py</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

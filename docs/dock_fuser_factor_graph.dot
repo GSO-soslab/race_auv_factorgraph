@@ -2,7 +2,7 @@
 // Render:  neato -n2 -Tsvg dock_fuser_factor_graph.dot -o dock_fuser_factor_graph.svg
 //
 // Scenario: one tag, three keyframes. X0 and X2 see tag a; X1 is a
-// fixed-tick keyframe with no tag in view.
+// detector message with no tag in view.
 // Positions are in points (72 per inch) and pinned (neato -n2).
 
 graph factor_graph {
@@ -28,11 +28,6 @@ graph factor_graph {
   o01 [pos="200,240", fillcolor="#2b6cb0", xlabel="odom"];
   o12 [pos="400,240", fillcolor="#2b6cb0", xlabel="odom"];
 
-  // Roll/pitch and depth priors from the EKF, every keyframe
-  a0 [pos="55,300",  fillcolor="#6b46c1", xlabel="roll/pitch"];  d0 [pos="145,300", fillcolor="#b83280", xlabel="depth"];
-  a1 [pos="255,300", fillcolor="#6b46c1", xlabel="roll/pitch"];  d1 [pos="345,300", fillcolor="#b83280", xlabel="depth"];
-  a2 [pos="455,300", fillcolor="#6b46c1", xlabel="roll/pitch"];  d2 [pos="545,300", fillcolor="#b83280", xlabel="depth"];
-
   // Tag projection (ternary: X_k, S, T_a), one per tag observation
   p0 [pos="100,165", fillcolor="#c53030", xlabel="proj"];
   p2 [pos="500,165", fillcolor="#c53030", xlabel="proj"];
@@ -43,7 +38,6 @@ graph factor_graph {
   // ---------------- Edges ----------------
   g0 -- X0;
   X0 -- o01 -- X1;  X1 -- o12 -- X2;
-  a0 -- X0; d0 -- X0;  a1 -- X1; d1 -- X1;  a2 -- X2; d2 -- X2;
 
   // projection factors: keyframe edge (blue), station edge (orange), tag edge (green)
   X0 -- p0 [color="#2b6cb0"];  p0 -- S [color="#c05621"];  p0 -- Ta [color="#2f855a"];

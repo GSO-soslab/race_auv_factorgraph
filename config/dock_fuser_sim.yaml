@@ -1,0 +1,73 @@
+# dock_fuser parameters for the Stonefish simulation.
+# Design reference: docs/DOCK_FUSER_PIPELINE.md (section numbers in comments).
+# Every estimator.* knob and its default is documented in
+# race_auv_factorgraph/core/common/config.py; only overrides need to appear here.
+dock_fuser:
+  ros__parameters:
+    # ------------------------------------------------------------ inputs (§3)
+    odom_topic: /race_auv/odometry/filtered     # robot_localization EKF (namespace race_auv)
+
+    # ------------------------------------------------------------ frames (§10)
+    graph_frame: race_auv/odom                  # = the EKF's odom frame
+    base_frame: race_auv/base_link
+    station_base_frame: race_station/base_link  # child of graph_frame in the TF tree
+    dock_frame: race_station/dock_point
+    # The station robot_state_publisher is not part of the AUV bringup, so
+    # publish base_link -> dock_point from the station URDF here.
+    publish_station_static_tf: true
+    dock_pose_topic: /race_auv/dock_point/pose
+
+    # ------------------------------------------------------------ URDFs (§3)
+    auv_urdf_package: race_auv_description
+    auv_urdf_file: urdf/base.urdf
+    station_urdf_package: race_station_description
+    station_urdf_file: urdf/base.urdf
+
+    # ------------------------------------------------------------ tags
+    # Black-square edge lengths, which is where the detector puts the corners.
+    # The sim textures have a white border: black square = 80% of the box
+    # (0.15 m box -> 0.12 m, 0.05 m box -> 0.04 m).
+    tag_family: "36h11"
+    tag_ids:   [146, 176, 185, 541, 558]
+    tag_sizes: [0.12, 0.12, 0.12, 0.04, 0.04]
+
+    # ------------------------------------------------------------ cameras (§3)
+    # fx/fy/cx/cy/width/height are those of the RECTIFIED image the detector
+    # runs on, not the raw calibration. Stonefish: 82 deg HFOV at 1600x1200,
+    # so fx = fy = 800 / tan(41 deg) = 920.2947. The rectifier
+    # (crop_to_valid_pixels) keeps K and crops one pixel row/column, giving a
+    # 1599x1199 image. If in doubt, compare with the detector's
+    # "Rectifier ready: ..." log line.
+    # One camera: each of its detector messages (tags or not) is one keyframe,
+    # so the detector's publish_rate (5 Hz on the Jetson) is the keyframe rate.
+    # cam_down's block below is kept for when multi-camera support returns.
+    camera_names: [cam_front]
+    cameras:
+      cam_front:
+        detections_topic: /cam_front/apriltag_detection/tags
+        frame: race_auv/cam_front        # T_bc = base_link -> cam_front from the AUV URDF
+        fx: 920.2947
+        fy: 920.2947
+        cx: 800.0
+        cy: 600.0
+        width: 1599
+        height: 1199
+      cam_down:
+        detections_topic: /cam_down/apriltag_detection/tags
+        frame: race_auv/cam_down
+        fx: 920.2947
+        fy: 920.2947
+        cx: 800.0
+        cy: 600.0
+        width: 1599
+        height: 1199
+
+    # ------------------------------------------------------------ keyframes (§6)
+    # No parameters: one keyframe per detector message of the camera above
+    # (its publish_rate, 7 Hz in the simulation apriltag.yaml).
+    ekf_buffer_seconds: 30.0    # EKF history for interpolating E(t) at each image stamp
+
+    # ------------------------------------------------------------ estimator (§5-§9)
+    estimator:
+      smoother_lag: 30.0
+      sigma_px: 1.0

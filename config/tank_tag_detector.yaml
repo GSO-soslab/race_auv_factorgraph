@@ -1,0 +1,37 @@
+# tag_detector_node (race_auv_camera_tag_factorgraph) parameters for
+# re-running detection on a recorded tank-test bag (front camera stellar2),
+# used by launch/bag_test.launch.py.
+#
+# The vehicle config lives in race_auv_bringup/config/tag_factorgraph_detector.yaml;
+# this one only differs in the tag set (tag 146, 12 cm black square).
+# The bag's camera runs at 15 Hz; the 5 Hz timer takes the newest image each
+# tick, i.e. every 3rd image, as the vehicle's Jetson does.
+/**:
+  ros__parameters:
+    image_topic: /race/stellar2/image/compressed
+    image_transport: compressed
+    camera_frame: race_auv/cam_front        # stellar2 is cam_front in the AUV URDF
+    publish_rate: 5.0
+    tag_ids: [146]
+    tag_sizes: [0.12]
+    threads: 4
+    quad_decimate: 2.0
+    refine_edges: true
+    min_edge_px: 10.0
+    min_side_px: 15.0
+    max_fit_rms_px: 1.5
+    publish_image: true                     # bag_test records it for plot_bev
+    jpeg_quality: 80
+    # Raw (distorted) UNDERWATER fisheye calibration
+    # (race_auv_bringup/config/camera/camera_parameters/stellar_cam.yaml).
+    # Rectified K, which tank_dock_fuser.yaml matches:
+    # fx 1165.2372, fy 1164.9232, cx 801.9339, cy 679.6697, 1600x1200.
+    intrinsics:
+      fx: 1262.74163
+      fy: 1262.40141
+      cx: 801.604094
+      cy: 670.832446
+      width: 1600
+      height: 1200
+      distortion: [-0.0011265, -0.1213276, 0.444942, -0.388063]
+      fisheye: true

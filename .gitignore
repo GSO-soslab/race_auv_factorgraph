@@ -259,3 +259,6 @@ tags
 docs/_build
 
 # End of https://www.toptal.com/developers/gitignore/api/clion,ros,pycharm,visualstudiocode,linux,vim,cmake,macos
+
+# Local copy of the TagSLAM paper (not redistributed; linked in docs/DOCK_FUSER_PIPELINE.md §14)
+docs/TagSLAM_*.pdf
