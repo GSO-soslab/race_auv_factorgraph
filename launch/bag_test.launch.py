@@ -68,7 +68,7 @@ RECORD_TOPICS = [
     "/cam_front/apriltag_detection/tags",
     "/cam_front/apriltag_detection/detections3d",
     "/cam_front/apriltag_detection/camera_info",
-    "/cam_front/apriltag_detection/image",
+    "/cam_front/apriltag_detection/image/compressed",
     "/race_auv/dock_point/pose",
     "/dock_fuser/auv_pose",
     "/dock_fuser/station_pose",
@@ -102,7 +102,7 @@ def _setup(context, *args, **kwargs):
 
     run_fuser = lc("run_fuser").lower() in ("1", "true", "yes")
     topics = [t for t in RECORD_TOPICS
-              if (lc("record_images").lower() in ("1", "true", "yes") or not t.endswith("/image"))
+              if (lc("record_images").lower() in ("1", "true", "yes") or not t.endswith("/image/compressed"))
               and (run_fuser or not (t.startswith("/dock_fuser") or "dock_point" in t))]
     record = ExecuteProcess(
         cmd=["ros2", "bag", "record", "--use-sim-time", "-s", "mcap", "-o", out, *topics],

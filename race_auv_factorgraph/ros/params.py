@@ -12,7 +12,7 @@ Parameter names are flat and dotted, exactly as ROS 2 sees them
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Dict, List, Sequence, Union
 
 import gtsam
@@ -59,9 +59,14 @@ NODE_DEFAULTS: Dict[str, Any] = {
     # Rate limit on the published odom -> station correction (§10).
     "output_max_trans_rate": 0.5,   # m/s
     "output_max_rot_rate": 0.5,     # rad/s
-    # Extra per-keyframe topics for offline analysis (tools/plot_bev.py):
-    # ~/auv_pose, ~/station_pose and ~/keyframe. See ros/node.py.
+    # Extra per-keyframe topics for analysis and live viewing (Foxglove):
+    # ~/auv_pose, ~/station_pose, ~/keyframe, ~/odometry, ~/path and
+    # ~/ekf_path. See ros/node.py.
     "publish_debug": False,
+    # ~/path and ~/ekf_path: re-published at path_rate Hz, holding the last
+    # path_length keyframes (3000 = 10 min at 5 Hz, ~250 kB per message each).
+    "path_rate": 1.0,
+    "path_length": 3000,
 }
 
 
@@ -107,6 +112,9 @@ class Setup:
     camera_extrinsics: Dict[str, gtsam.Pose3]  # camera name -> T_bc from the AUV URDF
     tags: Dict[TagKey, TagModel]
     T_dock_base: gtsam.Pose3          # station base_link in dock_point
+    # tag -> its station URDF link name (e.g. "apriltag36h11_146"), for the
+    # node's tag TF frames.
+    tag_links: Dict[TagKey, str] = field(default_factory=dict)
 
     def missing_intrinsics(self) -> List[str]:
         """Cameras still waiting for their camera_info."""
@@ -190,8 +198,10 @@ def build_setup(get: Callable[[str], Any], warn: Callable[[str], None]) -> Setup
     if not tags:
         raise ValueError("none of tag_ids exists in the station URDF")
 
+    links = station.tag_links()
     return Setup(cfg, cameras, frames, topics, info_topics, extrinsics, tags,
-                 station.transform(dock_link, get("station_base_link")))
+                 station.transform(dock_link, get("station_base_link")),
+                 {key: links[key] for key in tags})
 
 
 def flatten_params_yaml(path: str, node_name: str = "dock_fuser") -> Dict[str, Any]:

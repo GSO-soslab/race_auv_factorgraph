@@ -37,6 +37,13 @@ TF ``graph_frame -> station_base_frame`` (e.g. ``race_auv/odom -> race_station/b
 TF ``station_base_frame -> dock_frame`` (static, optional)
     From the station URDF, so ``dock_point`` exists even when the station's
     own ``robot_state_publisher`` is not running.
+TF ``dock_frame -> <station prefix>/apriltag<family>_<id>`` (with the static TF)
+    One frame per station tag, named as its station URDF link (e.g.
+    ``race_station/apriltag36h11_146``): the graph's ``T_j`` once the tag has
+    been seen, its URDF pose before. Published with each keyframe while
+    TRACKING, stamped with it. Only with ``publish_station_static_tf``, i.e.
+    when this node stands in for the station's ``robot_state_publisher``
+    (which would publish the same frame names).
 ``dock_pose_topic`` (``geometry_msgs/PoseWithCovarianceStamped``)
     ``X_k^-1 * S``: dock_point in ``base_frame``, once per keyframe while
     tracking. The covariance is that of the docking pose itself
@@ -52,6 +59,16 @@ Debug outputs (``publish_debug: true``), one message per keyframe
     keyframe* (the real-time estimate, not re-smoothed later).
 ``~/station_pose`` (``geometry_msgs/PoseStamped``, ``graph_frame``)
     ``S``: dock_point in odom, while tracking.
+``~/odometry`` (``nav_msgs/Odometry``, ``graph_frame`` -> ``base_frame``)
+    The same ``X_k`` as ``~/auv_pose``, as Odometry so it sits next to the
+    EKF's ``odom_topic`` in Foxglove / RViz (pose trail, x-y plot). Twist
+    and covariance are not estimated and left all zero.
+``~/path``, ``~/ekf_path`` (``nav_msgs/Path``, ``graph_frame``)
+    The last ``path_length`` keyframes of the graph's real-time ``X_k`` and of
+    the EKF ``E_k`` at the same stamps, published at ``path_rate`` Hz (not
+    per keyframe: the message grows with the track). A top-down 3D panel
+    then draws both tracks as lines, as ``tools/plot_graph.py --overview``
+    does offline. Point ``k`` of the two paths is the same keyframe.
 ``~/keyframe`` (``std_msgs/String``, JSON)
     ``{"stamp", "state", "camera", "n_tags", "accepted": [tags],
     "rejected": [[tag, reason]], "initialized_now", "recovered",
@@ -64,6 +81,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections import deque
 from typing import Dict, List, Optional
 
 import rclpy
@@ -76,7 +94,7 @@ from apriltag_msgs.msg import AprilTagDetectionArray
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped, TwistWithCovarianceStamped
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import String
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
@@ -197,6 +215,20 @@ class DockFuserNode(Node):
             self.dbg_auv_pub = self.create_publisher(PoseStamped, "~/auv_pose", 50)
             self.dbg_station_pub = self.create_publisher(PoseStamped, "~/station_pose", 50)
             self.dbg_kf_pub = self.create_publisher(String, "~/keyframe", 50)
+            self.dbg_odom_pub = self.create_publisher(Odometry, "~/odometry", 50)
+            # Paths: keyframe poses kept here, the whole (capped) path
+            # re-published at path_rate. deque(maxlen) drops the oldest.
+            self.dbg_path_pub = self.create_publisher(Path, "~/path", 1)
+            self.dbg_ekf_path_pub = self.create_publisher(Path, "~/ekf_path", 1)
+            n = int(g("path_length"))
+            self._path_X: deque = deque(maxlen=n)
+            self._path_E: deque = deque(maxlen=n)
+            self._path_dirty = False
+            self.create_timer(1.0 / float(g("path_rate")), self._publish_paths)
+        # Tag frames: dock_point's prefix + the URDF link name.
+        prefix = self.dock_frame.rsplit("/", 1)[0] + "/" if "/" in self.dock_frame else ""
+        self._tag_frames = ({tag: prefix + link for tag, link in setup.tag_links.items()}
+                            if g("publish_station_static_tf") else {})
         if g("publish_station_static_tf"):
             self._static_pub = StaticTransformBroadcaster(self)
             self._static_pub.sendTransform(self._tf_msg(
@@ -338,6 +370,7 @@ class DockFuserNode(Node):
 
         # odom -> station base = E_k * X_k^-1 * S * T_dock_base = D^-1 * S * T_dock_base (§10)
         self._target = res.drift_correction.inverse().compose(res.S).compose(self.T_dock_base)
+        self._publish_tag_tf(res.stamp)
 
         # /dock_point/pose: X_k^-1 * S in base_link, with the docking-pose covariance.
         dock = res.dock_in_base
@@ -367,7 +400,19 @@ class DockFuserNode(Node):
             o.x, o.y, o.z, o.w = quat_xyzw(T)
             return m
 
-        self.dbg_auv_pub.publish(pose_msg(res.X))
+        X_msg = pose_msg(res.X)
+        self.dbg_auv_pub.publish(X_msg)
+        odom = Odometry()
+        odom.header = X_msg.header
+        odom.child_frame_id = self.base_frame
+        odom.pose.pose = X_msg.pose
+        # Pose covariance and twist are not estimated: left all zero, the
+        # usual "not provided" for Odometry (a -1 marker, the Imu convention,
+        # makes RViz warn about a negative eigenvalue on every message).
+        self.dbg_odom_pub.publish(odom)
+        self._path_X.append(X_msg)
+        self._path_E.append(pose_msg(res.E))
+        self._path_dirty = True
         if res.S is not None:
             self.dbg_station_pub.publish(pose_msg(res.S))
         self.dbg_kf_pub.publish(String(data=json.dumps({
@@ -384,6 +429,29 @@ class DockFuserNode(Node):
             "init_note": res.init_note,
             "update_ms": round(res.update_time * 1000.0, 3),
         })))
+
+    def _publish_paths(self) -> None:
+        """Re-publish the capped graph / EKF paths (timer, ``path_rate``), if a keyframe came in."""
+        if not self._path_dirty:
+            return
+        self._path_dirty = False
+        for pub, poses in ((self.dbg_path_pub, self._path_X), (self.dbg_ekf_path_pub, self._path_E)):
+            msg = Path()
+            msg.header.stamp = poses[-1].header.stamp     # newest keyframe
+            msg.header.frame_id = self.graph_frame
+            msg.poses = list(poses)
+            pub.publish(msg)
+
+    def _publish_tag_tf(self, stamp: float) -> None:
+        """``dock_frame -> tag`` for every station tag: graph ``T_j`` if seen, else the URDF pose."""
+        if not self._tag_frames:
+            return
+        est = self.estimator.tag_estimates()
+        ros_stamp = _sec_to_stamp(stamp)
+        self.tf_pub.sendTransform([
+            self._tf_msg(est.get(tag, self.setup.tags[tag].T_dock_tag), self.dock_frame, frame,
+                         ros_stamp)
+            for tag, frame in self._tag_frames.items()])
 
     def _publish_station_tf(self, t: float, stamp) -> None:
         """Publish ``graph_frame -> station_base_frame``, rate-limited toward the graph's value."""

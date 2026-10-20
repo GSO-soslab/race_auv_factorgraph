@@ -15,6 +15,8 @@ dock_fuser:
     publish_station_static_tf: true
     dock_pose_topic: /race_auv/dock_point/pose
     publish_debug: true
+    path_rate: 1.0                 # ~/path, ~/ekf_path: re-published at this rate (Hz)
+    path_length: 3000              # keyframes kept in each path (10 min at 5 Hz)
 
     auv_urdf_package: race_auv_description
     auv_urdf_file: urdf/base.urdf
