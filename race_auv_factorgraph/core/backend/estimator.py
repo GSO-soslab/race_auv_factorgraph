@@ -84,6 +84,10 @@ class KeyframeResult:
     seeded_from_tag: bool = False        # X_k started at the tag-implied pose (_seed_from_tags)
     dvl_extra_sigma: float = 0.0         # extra odometry sigma (m) from a DVL dropout / re-lock
     update_time: float = 0.0             # seconds spent in this keyframe
+    # The frame's usable detections as single-image poses: (tag, camera,
+    # T_camera_tag of the best IPPE solution). Not used by the estimator
+    # itself; for plots (where a tag lands in odom through E_k vs X_k).
+    tag_obs: List[Tuple[TagKey, str, gtsam.Pose3]] = field(default_factory=list)
 
     @property
     def drift_correction(self) -> gtsam.Pose3:
@@ -223,6 +227,7 @@ class DockEstimator:
                                     for d in frame.detections]
             else:
                 dets, sols = self._usable_detections(frame, result)
+                result.tag_obs = [(d.tag, frame.camera, sols[d.tag][0][0]) for d in dets]
                 if dets and self.state != StationState.TRACKING:
                     pending = self._prepare_init_frame(k, stamp, E, X_hat, frame.camera,
                                                        dets, result)
