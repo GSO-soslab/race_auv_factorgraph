@@ -15,16 +15,24 @@ Tested on a Jetson Orin Nano Super (JetPack R39, Ubuntu 24.04, ROS 2 Jazzy, Pyth
 
 ```bash
 cd ~/ros2_ws/src
-git clone -b jazzy-devel-perception --recurse-submodules https://github.com/GSO-soslab/race_auv.git
-git clone -b jazzy-devel-docking-sim https://github.com/GSO-soslab/race_station.git
+git clone -b jazzy-devel-perception https://github.com/GSO-soslab/race_auv.git
+cd race_auv && git submodule update --init      # top-level submodules only (no --recursive)
+cd .. && git clone -b jazzy-devel-docking-sim https://github.com/GSO-soslab/race_station.git
 ```
 
-**`isaac_ros_nitros` needs git-lfs.** `race_auv_perception/third_party/isaac_ros_nitros` cannot be checked out without git-lfs, and `--recurse-submodules` then stops with an error. The detector and `dock_fuser` do not use it. Either install git-lfs before cloning, or skip that submodule:
+`git submodule update --init` without `--recursive` fetches the three submodules:
+- `race_auv_factorgraph`;
+- `race_auv_perception`;
+- `race_auv_sim`.
 
-```bash
-cd ~/ros2_ws/src/race_auv/race_auv_perception
-git submodule deinit -f third_party/isaac_ros_nitros
-```
+It leaves out the nested `race_auv_perception/third_party/isaac_ros_nitros` on purpose.
+
+**`isaac_ros_nitros` is optional.** It is only needed by `race_auv_apriltag_cuda`, the CUDA detector of the older `race_auv_camera_pkg` pipeline (`bringup_camera_perception.launch.py`).
+- **Not needed here:** the factor-graph detector (`race_auv_camera_tag_factorgraph`, CPU apriltag3) and `dock_fuser` do not use it.
+- **Builds without it:** `race_auv_apriltag_cuda` still builds. CMake warns "cuAprilTags library not found … Skipping the CUDA detector shim", and that package falls back to its CPU backend.
+- **Needs git-lfs:** do not clone with `--recurse-submodules` without git-lfs. That checkout stops with an error on this submodule.
+
+If you do want the CUDA detector, install git-lfs and run `race_auv_perception/scripts/setup_third_party.sh`.
 
 ## 2. Dependencies rosdep does not cover
 
