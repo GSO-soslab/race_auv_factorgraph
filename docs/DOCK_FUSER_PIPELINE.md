@@ -549,6 +549,8 @@ The pipeline uses the same measurement model as TagSLAM (B. Pfrommer and K. Dani
 
 ## 15. Running
 
+Setting up a Jetson (clone, the dependencies rosdep does not cover, network and clock, expected real-time margin): [JETSON_SETUP.md](JETSON_SETUP.md).
+
 ```bash
 # Unit + synthetic end-to-end tests
 colcon test --packages-select race_auv_factorgraph && colcon test-result --verbose
