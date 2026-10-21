@@ -35,6 +35,15 @@ NODE_DEFAULTS: Dict[str, Any] = {
     "dock_frame": "race_station/dock_point",
     "publish_station_static_tf": True,
     "dock_pose_topic": "dock_point/pose",
+    # Drop-in for the old apriltag_fuser's output (geometry_msgs/PoseStamped,
+    # dock_point in base_frame), with its "detection" meaning: published only
+    # on keyframes that added a tag factor, silent while no tag is seen. The
+    # docking mission counts these messages as tag detections. "" = off.
+    "compat_pose_topic": "",
+    # Graph-corrected odom frame: TF graph_frame -> corrected_frame =
+    # E_k * X_k^-1, so base_link sits at the graph's X_k in it (for Foxglove /
+    # RViz; the EKF's own odom drifts). "" = off.
+    "corrected_frame": "",
     # URDFs: an explicit path, or package + file inside its share directory.
     "auv_urdf_path": "",
     "auv_urdf_package": "race_auv_description",
@@ -50,9 +59,12 @@ NODE_DEFAULTS: Dict[str, Any] = {
     "tag_family": "36h11",
     "tag_ids": [146, 176, 185, 541, 558],
     "tag_sizes": [0.12, 0.12, 0.12, 0.04, 0.04],
-    # Exactly one camera: its detector messages are the keyframe clock
-    # (core/frontend/scheduler.py), see build_setup.
+    # Cameras whose detections dock_fuser subscribes to (each also has
+    # cameras.<name>.enabled). keyframe_camera's detector messages are the
+    # keyframe clock; every other enabled camera is attached to those
+    # keyframes (core/frontend/scheduler.py). "" = the first enabled camera.
     "camera_names": ["cam_front"],
+    "keyframe_camera": "",
     # Keyframe scheduling: seconds of EKF history kept for interpolating E(t)
     # at each image stamp. Must exceed the worst detector + transport delay.
     "ekf_buffer_seconds": 30.0,
@@ -80,6 +92,9 @@ def camera_defaults(name: str) -> Dict[str, Any]:
     detector, replays of old detection bags).
     """
     return {
+        # false: listed but unused (not subscribed), e.g. to switch cam_down
+        # off without editing camera_names.
+        f"cameras.{name}.enabled": True,
         f"cameras.{name}.detections_topic": f"/{name}/apriltag_detection/tags",
         # "" = the detections topic's sibling, /<cam>/apriltag_detection/camera_info
         f"cameras.{name}.camera_info_topic": "",
@@ -115,6 +130,8 @@ class Setup:
     # tag -> its station URDF link name (e.g. "apriltag36h11_146"), for the
     # node's tag TF frames.
     tag_links: Dict[TagKey, str] = field(default_factory=dict)
+    keyframe_camera: str = ""         # its frames are the keyframes
+    attached_cameras: List[str] = field(default_factory=list)  # the other enabled cameras
 
     def missing_intrinsics(self) -> List[str]:
         """Cameras still waiting for their camera_info."""
@@ -150,13 +167,17 @@ def build_setup(get: Callable[[str], Any], warn: Callable[[str], None]) -> Setup
     ``get(name)`` returns a parameter value (already defaulted);
     ``warn(msg)`` reports non-fatal problems.
     """
-    # One camera only. Each detector message becomes one keyframe at its image
-    # stamp; a second, unsynchronized camera would interleave its frames
-    # with the first one's, and out-of-order arrivals would be dropped.
-    # Supporting it needs a reordering step in the scheduler (§6).
-    if len(get("camera_names")) != 1:
-        raise ValueError(f"camera_names must list exactly one camera, got {list(get('camera_names'))}: "
-                         "keyframes follow a single detector's messages (see core/frontend/scheduler.py)")
+    # Cameras: the enabled ones of camera_names. One of them is the keyframe
+    # camera (its detector messages are the keyframes, §6); the others are
+    # attached to its keyframes instead of creating their own, so two
+    # unsynchronized detectors never interleave keyframes.
+    enabled = [n for n in get("camera_names") if bool(get(f"cameras.{n}.enabled"))]
+    if not enabled:
+        raise ValueError(f"no enabled camera in camera_names {list(get('camera_names'))}")
+    keyframe_camera = get("keyframe_camera") or enabled[0]
+    if keyframe_camera not in enabled:
+        raise ValueError(f"keyframe_camera '{keyframe_camera}' is not an enabled camera "
+                         f"(enabled: {enabled})")
     cfg = config_from_dict({k.split(".", 1)[1]: get(k) for k in estimator_defaults()})
     auv = Urdf.from_file(resolve_urdf(get, "auv"))
     station = Urdf.from_file(resolve_urdf(get, "station"))
@@ -165,7 +186,7 @@ def build_setup(get: Callable[[str], Any], warn: Callable[[str], None]) -> Setup
     # ---- cameras: T_bc from the AUV URDF; rectified intrinsics from the
     #      parameters if given, else later from the detector's camera_info
     cameras, frames, topics, info_topics, extrinsics = {}, {}, {}, {}, {}
-    for name in get("camera_names"):
+    for name in enabled:
         v = lambda key: get(f"cameras.{name}.{key}")  # noqa: E731
         link = v("urdf_link") or v("frame").split("/")[-1]
         extrinsics[name] = auv.transform(get("auv_base_link"), link)
@@ -201,7 +222,8 @@ def build_setup(get: Callable[[str], Any], warn: Callable[[str], None]) -> Setup
     links = station.tag_links()
     return Setup(cfg, cameras, frames, topics, info_topics, extrinsics, tags,
                  station.transform(dock_link, get("station_base_link")),
-                 {key: links[key] for key in tags})
+                 {key: links[key] for key in tags},
+                 keyframe_camera, [n for n in enabled if n != keyframe_camera])
 
 
 def flatten_params_yaml(path: str, node_name: str = "dock_fuser") -> Dict[str, Any]:

@@ -70,7 +70,7 @@ Camera model: the detector runs on rectified images, so corner pixels are alread
 | Input | Type | Use |
 |---|---|---|
 | `/race_auv/odometry/filtered` | `nav_msgs/Odometry` | Pose buffer for the odometry factors. |
-| `/cam_<name>/apriltag_detection/tags` | `apriltag_msgs/AprilTagDetectionArray` | Tag ID + 4 corner pixels per tag, stamped with the image time. One camera. Every message, also an empty one, is one keyframe (§6). Tag factors and initialization. |
+| `/cam_<name>/apriltag_detection/tags` | `apriltag_msgs/AprilTagDetectionArray` | Tag ID + 4 corner pixels per tag, stamped with the image time. One topic per enabled camera. Every message of the `keyframe_camera`, also an empty one, is one keyframe; the other cameras' messages with tags are attached to those keyframes (§6). Which tags each camera reports is the detector's `camera_tag_ids` (`tag_factorgraph_detector.yaml`), a subset of `station_tags.yaml`. Tag factors and initialization. |
 | Node YAML config | — | `K_C` of the camera, its detection topic, tag sizes, noise parameters. |
 | AUV URDF | — | `T_bc` of the camera. |
 | Station URDF | — | Tag poses relative to `dock_point` (links `apriltag<family>_<id>`). |
@@ -98,7 +98,7 @@ The corner detections come from `tag_detector_node` (`race_auv_perception/race_a
 | Raw camera calibration | `race_auv_bringup/config/tag_factorgraph_detector.yaml` | detector (rectification) |
 | Rectified camera matrix | the detector's latched `apriltag_detection/camera_info` | fuser |
 
-The fuser waits for the camera_info before processing any frame (frames queue in the scheduler meanwhile; `/diagnostics` says "waiting for camera_info"). The camera's topics and frame follow from its name, so the vehicle config only lists `camera_names: [cam_front]`. The offline tools read the camera_info from the bag (`bag_test.launch.py` records it), and `--config` takes several files merged in order, like the node (`--config station_tags.yaml dock_fuser.yaml`).
+The fuser waits for the camera_info before processing any frame (frames queue in the scheduler meanwhile; `/diagnostics` says "waiting for camera_info"). The camera's topics and frame follow from its name, so the vehicle config only lists `camera_names: [cam_front, cam_down]` (with `keyframe_camera: cam_front`; `cameras.cam_down.enabled: false` switches a listed camera off). The offline tools read the camera_info from the bag (`bag_test.launch.py` records it), and `--config` takes several files merged in order, like the node (`--config station_tags.yaml dock_fuser.yaml`).
 
 `cameras.<name>.fx/fy/cx/cy/width/height` in a config are an override, for inputs without camera_info: the simulation (legacy detector) and replays of older detection bags (`tank_dock_fuser.yaml`). They must be the RECTIFIED camera matrix, not the raw calibration; a mismatch scales every range estimate. When both exist, the node warns if they differ from the camera_info by more than 0.5 px.
 
@@ -238,7 +238,9 @@ One keyframe per detector message, at its image stamp. The tag detector (`tag_de
 - Every detector message is queued; frames are released strictly in stamp order once the EKF covers them. There is no extrapolation and no separate keyframe timer. The node runs the scheduler from both callbacks, so a frame is processed the moment its covering EKF message arrives.
 - A frame whose stamp is not newer than the previous one is dropped (`frames_dropped`): a re-published image, or an out-of-order message. The detector itself skips a timer tick when no new image has arrived, so this is only a guard.
 - If the EKF stream stops, at most 50 frames (10 s) wait; the oldest fall out.
-- **One camera.** A single detector's stamps only increase, so no reordering is needed. `build_setup` refuses a config with more than one camera: a second, unsynchronized camera would interleave its frames with the first, and each late arrival would be dropped. Supporting it needs a reordering step (hold a frame until every camera has reported a later stamp).
+- **One keyframe camera.** Only `keyframe_camera`'s messages become keyframes. A single detector's stamps only increase, so keyframes never need reordering, and a second, unsynchronized camera never interleaves keyframes with it.
+- **Attached cameras** (every other enabled camera, e.g. `cam_down`). A message with tags waits only for the EKF to cover its stamp `t` (empty ones are discarded); `DockEstimator.add_attached_frame` queues it, and the first keyframe update not older than it anchors it to the keyframe `X_j` **nearest** `t` (before or after). The camera was at `X(t) · T_bc = X_j · ΔE · T_bc` with `ΔE = E_j⁻¹ E(t)` (the EKF's motion in between, `t` may be before `t_j`), so each detection becomes an ordinary projection factor on `X_j` with the extrinsic `ΔE · T_bc`: no new variable, no new factor type, no keyframe, no extra optimizer run, and no keyframe ever waits for the other camera. Only the EKF's error over `|t − t_j|` (≤ `attach_max_dt`, 0.5 s) enters.
+- **Detector sync** (`sync_to` in `tag_factorgraph_detector.yaml`, set for cam_down). Two free-running 5 Hz detector timers on 15 Hz cameras pick images up to a full detector period apart (225 ms on the 10-20 run). A synced detector runs no timer: for every cam_front detection message it processes its own buffered image nearest that stamp (`race_auv_camera_tag_factorgraph/sync.py`, within `sync_max_dt`, 50 ms), so the two detections are at most half a camera frame apart plus the cameras' phase (10-20 images: median 29, max 47 ms, every cam_front frame matched). With nearest-keyframe anchoring a synced cam_down frame lands on its own keyframe, also when its image is slightly earlier. Attached frames are used only while TRACKING (the station initializes from the keyframe camera), and not across a DVL dropout or re-lock (the EKF steps there). A tag first seen by an attached camera gets its `T_j` at the URDF pose with the mounting prior, as for the keyframe camera: once `S` is known its pose is already predicted to the mounting tolerance, so it needs no initialization of its own. Synthetic pass over the station (cam_front blind for the last 2 s, cam_down seeing the bottom tags 176/185 only): docking error 0.6 cm with cam_down attached vs 2.4 cm without (`test_attached_camera_tags_enter_after_initialization`).
 - **Detector rate.** At 5 Hz the fixed-lag window holds ~150 poses. Odometry-only poses are the expensive ones to marginalize (iSAM2 re-eliminates much of the tree for them; ~0.5 ms for a pose with a tag factor vs ~7 ms at 150 poses and ~25 ms at 450 poses, desktop), so update time grows with the detector rate. Tank run at 5 Hz: update median 0.6 ms, p95 7.6 ms, max ~20 ms, the same as the earlier tag-frames-plus-5 Hz-tick scheduler at that rate, with identical docking-pose accuracy.
 
 **Timing across machines.** On the vehicle, the EKF runs on the front-seat computer and the camera, detector and estimator on the Jetson; messages cross over zenoh. Only header stamps are used, never arrival times, so transport latency and jitter do not shift a keyframe: a late EKF message only makes the frame wait. Two things stamps cannot fix:
@@ -411,10 +413,13 @@ Error handling:
 | TF `station base_link → dock_point` (static, `publish_station_static_tf`) | station URDF `dock_point_joint` | once |
 | TF `dock_point → race_station/apriltag<family>_<id>` (`publish_station_static_tf`) | per station tag: the graph's `T_j` once seen, the URDF pose before; frame names = the station URDF links | each keyframe, while TRACKING |
 | `/dock_point/pose` (`PoseWithCovarianceStamped`) | `X_k⁻¹ · S` in `base_link`, with the covariance of that relative pose | each keyframe |
-| `/diagnostics` | station state, tags accepted / rejected and why, update time, init progress, drift correction | 1 Hz |
+| `compat_pose_topic` (`PoseStamped`; vehicle: `/race_station/dock_point/pose`) | drop-in for the old `apriltag_fuser`, with its *detection* meaning (the docking mission counts these messages as tag detections): `X_k⁻¹ · S` in `base_link`, moved to the newest EKF stamp by the EKF's relative motion since the keyframe (not during a DVL dropout), not rate-limited | only keyframes that added a tag factor (keyframe camera or attached); silent while no tag is seen |
+| TF `odom → corrected_frame` (vehicle: `race_auv/odom_graph`) | `E_k · X_k⁻¹`: `base_link` sits at the graph's `X_k` in it and the station is fixed there; display frame for Foxglove / RViz | EKF rate, not rate-limited |
+| `/diagnostics` | station state, tags accepted / rejected and why, update time, init progress, drift correction; ERROR if another node also publishes `compat_pose_topic` (old `apriltag_fuser` running) | 1 Hz |
 | `~/auv_pose`, `~/station_pose`, `~/keyframe` (`publish_debug`) | `X_k` and `S` in odom, and a JSON record per keyframe | each keyframe |
 | `~/odometry` (`nav_msgs/Odometry`, `publish_debug`) | `X_k` in odom (`odom → base_link`), to set beside the EKF's `/race_auv/odometry/filtered`; twist and covariance not estimated (left zero) | each keyframe |
 | `~/path`, `~/ekf_path` (`nav_msgs/Path`, `publish_debug`) | the last `path_length` (3000) keyframes of the real-time `X_k` and of `E_k` at the same stamps | `path_rate` (1 Hz) |
+| `~/path_graph` (`nav_msgs/Path`, `publish_debug` and `corrected_frame`) | the same poses as `~/path`, stamped in `corrected_frame` | `path_rate` (1 Hz) |
 
 **Watching it live (Foxglove).** With `publish_debug: true` (on in `race_auv_bringup/config/dock_fuser.yaml`), a 3D panel with display frame `race_auv/odom`, a top-down camera and the topics `/dock_fuser/path` and `/dock_fuser/ekf_path` draws the graph's and the EKF's tracks as two lines, the live version of the `plot_graph --overview` figures. A Plot panel can put `/dock_fuser/odometry.pose.pose.position.x` (or `.y`) beside the EKF's `/race_auv/odometry/filtered.pose.pose.position.x` over time. The paths are re-sent whole (~250 kB each at 3000 poses), hence the 1 Hz rate; lower `path_length` for a slow link.
 
@@ -424,7 +429,11 @@ The station's own `robot_state_publisher` hangs `dock_point` and the tag frames 
 
 **Why `E_k · X_k⁻¹ · S` and not just `S`.** The EKF keeps publishing `odom → base_link = E_k`, which drifts. The graph's corrected AUV pose is `X_k`, and its station is `S`. The TF tree composes `odom → base_link` with `odom → station`, so `base_link → station = E_k⁻¹ · (odom → station)`. Publishing `E_k · X_k⁻¹ · S` makes that equal `X_k⁻¹ · S`, the graph's corrected relative pose. Publishing `S` alone would give `E_k⁻¹ · S`, which mixes the drifted EKF pose with the graph's station and is wrong whenever `X_k ≠ E_k`. This is the same role `map → odom` plays in REP-105: the edge absorbs the drift correction, so it moves slowly as drift accumulates even though the station itself is static.
 
-Corrections to `odom → station` are rate-limited (interpolated toward the new value) so the controller never sees a jump.
+Corrections are rate-limited so the controller never sees the graph's estimate jump, and the limit acts on the relative pose `base_link → station`, not on `odom → station` (`ros/node.py:StationTfLimiter`). The published relative pose is carried forward by the EKF's motion between messages and stepped toward the graph's target at `output_max_trans_rate` / `output_max_rot_rate`; the TF is `E(t) · relative`, which in steady state is exactly `E_k · X_k⁻¹ · S · T_dock_base`. An EKF snap (DVL re-lock) does not change the relative pose, so it lands in the odom edge at once: across a DVL dropout or re-lock (flagged by the DVL monitor) the EKF's step is not trusted and the relative pose takes the target directly. Limiting in `odom` instead (the first version) turned the 1.65 m snap at 220.0 s of the 10-20 run into a slew, and `base_link → dock_point` through the TF was off by up to 1.84 m for ~3.4 s; now it equals the graph's docking pose there, except for the rate-limited slewing of the graph's own re-seed correction (≤ 16 cm, ~0.4 s). `compat_pose_topic` is not rate-limited.
+
+**Graph-corrected display frame.** `race_auv/odom` is the EKF's frame: during a DVL dropout the AUV model (placed by the EKF's `odom → base_link`) and the station (placed by `odom → station`, which follows the drift on purpose) slide together while `~/path` stays put. In `corrected_frame` (`race_auv/odom_graph`) the AUV is at `X_k`, the station is fixed and `~/path_graph` lines up with the model: `bringup_rviz_factorgraph.launch.py fixed_frame:=race_auv/odom_graph graph_path:=/dock_fuser/path_graph`, or that display frame in Foxglove.
+
+**Replacing the old apriltag_fuser.** The docking mission (`race_docking_mission`) subscribes to `/race_station/dock_point/pose` (`PoseStamped`, `base_link`) and treats every message as a tag detection (debounce, tag-lost timeouts). `compat_pose_topic` keeps that meaning, so the mission runs unchanged; the continuous estimate, also while blind, is the TF and `/race_auv/dock_point/pose`. The two fusers must not run together (same topic, and two parents for `race_station/dock_point`): `fuser.enabled: false` in `apriltag.yaml`. The mission's `apriltag_absolute_pose` (a tag-derived yaw for the EKF) must not be fused into `robot_localization` while dock_fuser runs: dock_fuser uses the EKF as its odometry, so the tag information would count twice.
 
 ---
 
@@ -476,6 +485,8 @@ race_auv_factorgraph/          # repo root = the ROS package
       evaluate.py              # error vs sim truth, held-out frames, leave-one-tag-out
       plot_bev.py              # BEV plot of a bag_test run
       plot_graph.py            # the real factor graph over a short window; whole-run overview
+      analyze_run.py           # live run: recorded EKF vs recorded fixed-lag vs batch LM (YAML-driven)
+      redetect_bag.py          # re-run the detectors (other tags per camera) on the images the live run used
   test/
     test_jacobians.py          # finite-difference check for every CustomFactor
     test_scenarios.py          # synthetic end-to-end scenarios
@@ -585,6 +596,17 @@ ros2 run race_auv_factorgraph plot_graph <detection bag> --config <dock_fuser ya
 # ... or the whole run with a box around each window
 ros2 run race_auv_factorgraph plot_graph <detection bag> --config <dock_fuser yaml> --start 30 \
     --overview 420 --window 91.5 96.5 --window 228.5 232.5 --out overview.png
+
+# A live run (node recorded with publish_debug: true): recorded EKF and fixed-lag
+# estimates vs batch LM over the whole bag; overview, live-vs-LM and window graph
+# figures, CSV and summary. One YAML per recording (bag, node config, windows, ...)
+python3 race_auv_factorgraph/tools/analyze_run.py config/analyze_run_example.yaml
+
+# Try other detector settings (e.g. per-camera camera_tag_ids) on a live run: re-detect
+# exactly the images the live detectors processed, then analyze that bag (the replay with
+# the new settings is drawn as its own track next to the recorded live one)
+python3 race_auv_factorgraph/tools/redetect_bag.py <live bag> --out <live bag>_redetect
+python3 race_auv_factorgraph/tools/analyze_run.py config/analyze_run_10_20_26_camtags.yaml
 
 # Deterministic offline re-run of the fuser on a bag that already has the tags topic.
 # --frame-stride 3 replays a 15 Hz detector bag as the vehicle's 5 Hz detector would see it.

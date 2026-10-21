@@ -124,7 +124,18 @@ class ScenarioConfig:
     dvl_rate: float = 5.0
     # Only these tags are ever detected (None = all).
     visible_tags: Optional[List[int]] = None
-    cameras: Tuple[str, ...] = ("cam_front",)   # one camera: the estimator supports one
+    # Per camera, the tags its detector reports (camera_tag_ids); a camera
+    # not listed reports every visible tag.
+    camera_tags: Dict[str, List[int]] = field(default_factory=dict)
+    # Detectors of the attached cameras synced to the keyframe camera
+    # (tag detector sync_to): their images are the ones nearest each keyframe
+    # camera image, here sync_offset away (two 15 Hz cameras: |offset| <=
+    # 33 ms). False: free-running timers, phase-shifted by up to a period.
+    sync_cameras: bool = False
+    sync_offset: float = 0.02
+    # The first camera is the keyframe camera; the others are attached to its
+    # keyframes (core/frontend/scheduler.py), as in the node.
+    cameras: Tuple[str, ...] = ("cam_front",)
     seed: int = 0
 
 
@@ -209,6 +220,8 @@ def make_scenario(c: ScenarioConfig = ScenarioConfig()) -> Scenario:
     for ci, cam_name in enumerate(c.cameras):
         cam = cams[cam_name]
         offset = 0.31 * (ci + 1) / c.camera_rate   # not aligned with the EKF ticks
+        if c.sync_cameras and ci > 0:
+            offset = 0.31 / c.camera_rate + c.sync_offset   # keyframe camera's clock + offset
         t = offset
         while t < c.duration:
             dets = []
@@ -216,6 +229,8 @@ def make_scenario(c: ScenarioConfig = ScenarioConfig()) -> Scenario:
                 X = _true_pose(c, S_true, t)
                 for key, tag in tags.items():
                     if c.visible_tags is not None and key[1] not in c.visible_tags:
+                        continue
+                    if cam_name in c.camera_tags and key[1] not in c.camera_tags[cam_name]:
                         continue
                     uv, depth = project_tag(X, S_true, T_true[key], cam, tag)
                     if np.any(depth < 0.1) or np.mean(depth) > c.max_range:
@@ -248,7 +263,7 @@ def run(scn: Scenario, est: DockEstimator) -> List[KeyframeResult]:
     Frames are delivered 0.1 s after their stamp, emulating detector latency;
     the scheduler releases each one once the EKF covers its stamp.
     """
-    sched = KeyframeScheduler()
+    sched = KeyframeScheduler(attached_cameras=scn.cfg.cameras[1:])
     latency = 0.1
     events = [(t, 0, E) for t, E in scn.odometry] + \
              [(f.stamp + latency, 1, f) for f in scn.frames] + \
@@ -264,6 +279,8 @@ def run(scn: Scenario, est: DockEstimator) -> List[KeyframeResult]:
             est.dvl.add(payload)
         for kf in sched.poll():
             results.append(est.process_keyframe(kf.stamp, kf.E, kf.frame))
+        for af in sched.poll_attached():
+            est.add_attached_frame(af.stamp, af.E, af.frame)
     return results
 
 

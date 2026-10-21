@@ -166,13 +166,146 @@ def test_detection_min_side():
     assert abs(d.min_side_px() - 30.0) < 1e-12
 
 
-def test_setup_refuses_more_than_one_camera():
-    """Keyframes follow one detector's messages; two cameras must fail loudly at startup."""
+def _getter(**over):
+    """Parameter accessor with the node defaults (plus per-camera ones), like getter_from_yaml."""
+    from race_auv_factorgraph.ros.params import NODE_DEFAULTS, camera_defaults, estimator_defaults
+    d = {**NODE_DEFAULTS, **estimator_defaults()}
+    for name in over.get("camera_names", NODE_DEFAULTS["camera_names"]):
+        d.update(camera_defaults(name))
+    d.update(over)
+    return lambda k: d[k]
+
+
+def test_setup_camera_roles():
+    """keyframe_camera drives keyframes; every other enabled camera is attached; disabled is unused."""
     import pytest
     from race_auv_factorgraph.ros.params import build_setup
-    names = {"camera_names": ["cam_front", "cam_down"]}
-    with pytest.raises(ValueError, match="exactly one camera"):
-        build_setup(lambda k: names[k], lambda m: None)
+    pytest.importorskip("ament_index_python")
+    two = dict(camera_names=["cam_front", "cam_down"], keyframe_camera="cam_front")
+    s = build_setup(_getter(**two), lambda m: None)
+    assert s.keyframe_camera == "cam_front" and s.attached_cameras == ["cam_down"]
+    assert set(s.camera_topics) == {"cam_front", "cam_down"}
+    # cam_down switched off: not subscribed, not attached (today's single-camera setup).
+    off = build_setup(_getter(**two, **{"cameras.cam_down.enabled": False}), lambda m: None)
+    assert off.attached_cameras == [] and set(off.camera_topics) == {"cam_front"}
+    # Default keyframe camera: the first enabled one.
+    first = build_setup(_getter(camera_names=["cam_front", "cam_down"]), lambda m: None)
+    assert first.keyframe_camera == "cam_front"
+
+
+def test_setup_refuses_bad_camera_config():
+    import pytest
+    from race_auv_factorgraph.ros.params import build_setup
+    with pytest.raises(ValueError, match="not an enabled camera"):
+        build_setup(_getter(camera_names=["cam_front", "cam_down"], keyframe_camera="cam_down",
+                            **{"cameras.cam_down.enabled": False}), lambda m: None)
+    with pytest.raises(ValueError, match="no enabled camera"):
+        build_setup(_getter(**{"cameras.cam_front.enabled": False}), lambda m: None)
+
+
+# ----------------------------------------------------------------------- attached cameras
+def test_scheduler_attached_frames_never_become_keyframes():
+    """An attached camera's frames with tags wait only for the EKF; empty ones are discarded."""
+    s = KeyframeScheduler(attached_cameras=["cam_down"])
+    s.add_odometry(0.0, gtsam.Pose3())
+    assert s.add_frame(_frame(0.10))                         # keyframe camera
+    assert s.add_frame(_frame(0.13, cam="cam_down"))          # attached, with a tag
+    assert not s.add_frame(_frame(0.18, cam="cam_down", tags=False))   # empty: not queued
+    assert not s.add_frame(_frame(0.13, cam="cam_down"))      # re-published image: dropped
+    assert s.add_frame(_frame(0.12))   # attached stamps do not affect the keyframe order
+    assert s.poll() == [] and s.poll_attached() == []         # EKF not there yet
+    s.add_odometry(0.2, gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.2, 0, 0)))
+    assert [k.stamp for k in s.poll()] == [0.10, 0.12]
+    att = s.poll_attached()
+    assert [(a.stamp, a.frame.camera) for a in att] == [(0.13, "cam_down")]
+    assert abs(att[0].E.translation()[0] - 0.13) < 1e-9       # EKF at the attached stamp
+    assert s.n_dropped == 1 and s.n_pending == 0
+
+
+def test_attached_extrinsic_equals_camera_at_image_time():
+    """Projection through X_j with T_bc' = dE T_bc equals projection from X_j dE with T_bc."""
+    import dataclasses
+    cams, tags = default_cameras(), default_tags()
+    cam, tag = cams["cam_down"], tags[("36h11", 176)]
+    S = pose_from_xyz_rpy([0, 0, 0], [0, 0, 0])
+    X_j = pose_from_xyz_rpy([-0.4, 0.05, 0.6], [0.02, -0.01, 0.05])
+    dE = pose_from_xyz_rpy([0.03, -0.01, 0.004], [0.002, 0.001, 0.01])   # 0.2 s of motion
+    cam_at_anchor = dataclasses.replace(cam, T_bc=dE.compose(cam.T_bc))
+    uv_attached, _ = project_tag(X_j, S, tag.T_dock_tag, cam_at_anchor, tag)
+    uv_direct, _ = project_tag(X_j.compose(dE), S, tag.T_dock_tag, cam, tag)
+    assert np.abs(uv_attached - uv_direct).max() < 1e-9
+    assert cam.T_bc.equals(default_cameras()["cam_down"].T_bc, 1e-12)   # original untouched
+
+
+def test_attached_frame_rejected_before_tracking():
+    from race_auv_factorgraph.core.backend.estimator import DockEstimator
+    from race_auv_factorgraph.core.common.config import EstimatorConfig
+    est = DockEstimator(EstimatorConfig(), default_cameras(), default_tags())
+    est.process_keyframe(0.0, gtsam.Pose3())
+    est.add_attached_frame(0.05, gtsam.Pose3(), _frame(0.05, cam="cam_down"))
+    est.add_attached_frame(0.25, gtsam.Pose3(), _frame(0.25, cam="cam_down"))
+    res = est.process_keyframe(0.2, gtsam.Pose3())
+    # Anchored in the next keyframe's update; the later frame waits for the one after.
+    assert [a.stamp for a in res.attached] == [0.05] and res.n_attached_accepted == 0
+    assert "before TRACKING" in res.attached[0].rejected[0][1]
+    assert [a.stamp for a in est.process_keyframe(0.4, gtsam.Pose3()).attached] == [0.25]
+
+
+# ----------------------------------------------------------------------- node outputs
+def test_compat_pose_is_docking_pose_moved_by_ekf_motion():
+    """The detection-style pose is X_k^-1 S at t_k, moved by the EKF's relative motion after it,
+    so an EKF snap (DVL re-lock: the whole EKF track shifts) leaves it unchanged."""
+    import pytest
+    pytest.importorskip("rclpy")
+    from race_auv_factorgraph.core.backend.estimator import KeyframeResult
+    from race_auv_factorgraph.core.init.state_machine import StationState
+    from race_auv_factorgraph.ros.node import compat_dock_pose, corrected_frame_transform
+    X = pose_from_xyz_rpy([-1.5, 0.3, 0.4], [0.01, 0.02, 0.2])
+    E = pose_from_xyz_rpy([-1.2, 0.1, 0.38], [0.012, 0.018, 0.15])   # drifted EKF
+    S = pose_from_xyz_rpy([0.1, -0.05, 0.0], [0.0, 0.0, 0.3])
+    res = KeyframeResult(k=7, stamp=1.0, state=StationState.TRACKING, X=X, E=E, S=S)
+    assert compat_dock_pose(E, E, res.dock_in_base).equals(res.dock_in_base, 1e-9)
+    # 0.1 s later the AUV moved forward 3 cm (in its own frame): the dock is 3 cm closer.
+    step = pose_from_xyz_rpy([0.03, 0.0, 0.0], [0.0, 0.0, 0.0])
+    moved = compat_dock_pose(E, E.compose(step), res.dock_in_base)
+    assert moved.equals(step.inverse().compose(res.dock_in_base), 1e-9)
+    # An EKF snap shifts E_k and E(t) alike: the result does not change.
+    snap = pose_from_xyz_rpy([1.65, -0.3, 0.0], [0.0, 0.0, 0.02])
+    assert compat_dock_pose(snap.compose(E), snap.compose(E.compose(step)),
+                            res.dock_in_base).equals(moved, 1e-9)
+    # In the corrected frame, base_link (at E in odom) lands on the graph's X_k.
+    assert corrected_frame_transform(res).inverse().compose(E).equals(X, 1e-9)
+
+
+def test_station_tf_limiter_passes_ekf_snaps_and_limits_graph_corrections():
+    """TF odom -> station: base_link -> station is rate-limited, an EKF snap is not."""
+    import pytest
+    pytest.importorskip("rclpy")
+    from race_auv_factorgraph.ros.node import StationTfLimiter
+    rel = pose_from_xyz_rpy([1.5, -0.2, -0.3], [0.0, 0.0, 0.1])     # base_link -> station
+    E0 = pose_from_xyz_rpy([2.0, 1.0, -3.0], [0.0, 0.0, 0.5])
+    lim = StationTfLimiter(max_trans_rate=0.5, max_rot_rate=0.5)
+    lim.set_target(E0, rel, jump=True)
+    # Steady state: odom -> station = E_k * rel_k, so base_link -> station = rel_k.
+    assert E0.inverse().compose(lim.update(0.0, E0)).equals(rel, 1e-9)
+    # EKF snap of 1.65 m between two messages (DVL re-lock: not reliable), AUV not moving:
+    # base_link -> station must not move at all, the odom edge takes the whole snap.
+    snap = pose_from_xyz_rpy([1.65, -0.3, 0.0], [0.0, 0.0, 0.02])
+    E1 = snap.compose(E0)
+    lim.set_target(E1, rel)                       # the graph: relative pose unchanged
+    assert E1.inverse().compose(lim.update(0.05, E1, ekf_reliable=False)).equals(rel, 1e-9)
+    # A graph correction (tag back after a gap: target 1 m away) moves at <= 0.5 m/s.
+    rel2 = pose_from_xyz_rpy([2.5, -0.2, -0.3], [0.0, 0.0, 0.1])
+    lim.set_target(E1, rel2)
+    out = [E1.inverse().compose(lim.update(0.05 + 0.05 * i, E1)) for i in range(1, 5)]
+    steps = [pose_distance(a, b)[0] for a, b in zip([rel] + out, out)]
+    assert max(steps) <= 0.5 * 0.05 + 1e-9 and pose_distance(out[-1], rel)[0] > 0.09
+    # The AUV moving under a steady estimate: base_link -> station follows the motion exactly.
+    lim.set_target(E1, rel, jump=True)
+    lim.update(1.0, E1)
+    fwd = pose_from_xyz_rpy([0.02, 0.0, 0.0], [0.0, 0.0, 0.0])
+    E2 = E1.compose(fwd)
+    assert E2.inverse().compose(lim.update(1.05, E2)).equals(fwd.inverse().compose(rel), 1e-9)
 
 
 # ----------------------------------------------------------------------- DVL monitor

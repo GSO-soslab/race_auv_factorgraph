@@ -24,6 +24,9 @@ Per keyframe (:meth:`DockEstimator.process_keyframe`)
 
 5. **Update the smoother.** If initialization succeeds on this keyframe, a second
    update inserts ``S``, the ``T_j`` and **all** buffered projection factors.
+   Frames of *attached* cameras received since the previous keyframe
+   (:meth:`DockEstimator.add_attached_frame`) whose stamp is not after this
+   keyframe are anchored now and their factors go into the same update.
 6. **Read back** ``X_k``, ``S`` and the ``T_j``.
 7. **Output** quantities for the node (§10): the drift correction
    ``D = X_k * E_k^-1``, the ``odom -> station`` transform ``D^-1 * S`` and the
@@ -39,11 +42,13 @@ future GPS mode replaces :meth:`add_anchor` and publishes ``D`` as
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import gtsam
 import numpy as np
@@ -61,6 +66,21 @@ from ..init.state_machine import StationInitializer, StationState
 from .smoother import Backend
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class AttachedResult:
+    """What one attached camera's frame contributed (see :meth:`DockEstimator.add_attached_frame`)."""
+
+    stamp: float                         # image stamp of the attached frame
+    camera: str
+    anchor_k: Optional[int] = None       # keyframe its factors act on
+    accepted: List[TagKey] = field(default_factory=list)
+    rejected: List[Tuple[TagKey, str]] = field(default_factory=list)
+    # (tag, T_bt): tag pose in the ANCHOR keyframe's body frame,
+    # ``(E_j^-1 E(t)) * T_bc * T_ct`` with the single-image PnP pose
+    # ``T_ct``. For plots: ``X_j * T_bt`` is where this observation puts the tag.
+    tag_obs: List[Tuple[TagKey, gtsam.Pose3]] = field(default_factory=list)
 
 
 @dataclass
@@ -88,6 +108,15 @@ class KeyframeResult:
     # T_camera_tag of the best IPPE solution). Not used by the estimator
     # itself; for plots (where a tag lands in odom through E_k vs X_k).
     tag_obs: List[Tuple[TagKey, str, gtsam.Pose3]] = field(default_factory=list)
+    # Attached frames (other cameras) anchored in this keyframe's update, to
+    # this keyframe or a recent one; the accepted ones' factors entered the
+    # graph now. ``accepted`` above stays this keyframe's own camera only.
+    attached: List[AttachedResult] = field(default_factory=list)
+
+    @property
+    def n_attached_accepted(self) -> int:
+        """Tag factors this update added from attached cameras."""
+        return sum(len(a.accepted) for a in self.attached)
 
     @property
     def drift_correction(self) -> gtsam.Pose3:
@@ -156,6 +185,10 @@ class DockEstimator:
         self._cov_cache: Optional[np.ndarray] = None
         self._cov_stamp: Optional[float] = None
         self.last_result: Optional[KeyframeResult] = None
+        # Recent keyframes (k, stamp, E_k), for anchoring attached frames.
+        self._history: Deque[Tuple[int, float, gtsam.Pose3]] = deque(maxlen=200)
+        # Attached frames waiting to be anchored: (stamp, E(t), frame).
+        self._attached_pending: Deque[Tuple[float, gtsam.Pose3, TagFrame]] = deque(maxlen=100)
         # Cumulative counters for diagnostics.
         self.n_tag_factors = 0
         self.n_rejected = 0
@@ -235,6 +268,8 @@ class DockEstimator:
                     self._add_tracking_factors(k, stamp, X_hat, frame.camera, dets, sols, graph,
                                                values, timestamps, result)
 
+        result.attached = self._attach_pending(k, stamp, E, graph, values, timestamps)
+
         if self.state == StationState.TRACKING:
             # Keep S and the T_j inside the fixed-lag window forever (§9).
             K.restamp(timestamps, [K.S] + self.tag_index.keys(), stamp)
@@ -257,16 +292,107 @@ class DockEstimator:
         if X_k is None:
             X_k = X_hat
         self._prev_X, self._prev_E, self._prev_stamp = X_k, E, stamp
+        self._history.append((k, stamp, E))
         result.X = X_k
         result.state = self.state
         if self.state == StationState.TRACKING:
             result.S = self.backend.pose(K.S)
             result.dock_cov = self._dock_covariance(xk, stamp)
-        self.n_tag_factors += len(result.accepted)
-        self.n_rejected += len(result.rejected)
+        self.n_tag_factors += len(result.accepted) + result.n_attached_accepted
+        self.n_rejected += len(result.rejected) + sum(len(a.rejected) for a in result.attached)
         result.update_time = time.perf_counter() - t0
         self.last_result = result
         return result
+
+    def add_attached_frame(self, stamp: float, E: gtsam.Pose3, frame: TagFrame) -> None:
+        """Queue another camera's frame for attaching to the nearest keyframe (§6, attached cameras).
+
+        The frame never becomes a keyframe. Its tags become projection
+        factors on the keyframe ``X_j`` nearest ``stamp`` (before or after):
+        the camera was at ``X(t) T_bc`` when the image was taken, and between
+        ``t_j`` and ``t`` the AUV moved by what the EKF measured,
+        ``dE = E_j^-1 E(t)`` (``t`` may be before ``t_j``), so
+
+            X(t) T_bc  =  X_j * dE * T_bc.
+
+        The factor is the ordinary projection factor on ``X_j`` with the
+        camera extrinsic ``dE * T_bc`` in place of ``T_bc``: no new variable,
+        no new factor type. Only the EKF's error over ``|t - t_j|`` enters:
+        at most half a camera frame (33 ms) with a detector synced to the
+        keyframe camera (``sync_to``), up to one detector period without.
+
+        The frame is anchored in :meth:`process_keyframe`, inside its update
+        (no extra optimizer run): at the first keyframe not older than it, so
+        that both neighbours of ``t`` are known and a synced frame lands on
+        its own keyframe. See :meth:`_attach_pending` for when it is rejected.
+        """
+        self._attached_pending.append((float(stamp), E, frame))
+
+    def _attach_pending(self, k: int, stamp: float, E: gtsam.Pose3,
+                        graph: gtsam.NonlinearFactorGraph, values: gtsam.Values,
+                        timestamps: Dict[int, float]) -> List[AttachedResult]:
+        """Anchor the queued attached frames not after keyframe ``k`` and add their factors.
+
+        Candidates are this keyframe (being created in this update) and the
+        recent ones still in the smoother. A frame is rejected (every
+        detection, with the reason) before TRACKING (initialization uses the
+        keyframe camera), when its nearest keyframe is more than
+        ``attach_max_dt`` away (the keyframe camera was late or silent), or
+        when the DVL had no bottom lock between the two (the EKF steps there).
+        A tag first seen by an attached camera gets its ``T_j`` at the URDF
+        pose with the mounting prior, as for the keyframe camera.
+        """
+        due = [p for p in self._attached_pending if p[0] <= stamp]
+        if not due:
+            return []
+        self._attached_pending = deque((p for p in self._attached_pending if p[0] > stamp),
+                                       maxlen=self._attached_pending.maxlen)
+        cfg = self.cfg
+        mount_rot = math.radians(cfg.sigma_mount_rot_deg)
+        candidates = [*self._history, (k, stamp, E)]
+        out: List[AttachedResult] = []
+        for t, E_t, frame in due:
+            r = AttachedResult(stamp=t, camera=frame.camera)
+            out.append(r)
+
+            def reject_all(reason: str) -> None:
+                r.rejected += [(d.tag, reason) for d in frame.detections]
+
+            if frame.camera not in self.cameras:
+                reject_all(f"unknown camera '{frame.camera}'")
+                continue
+            if self.state != StationState.TRACKING:
+                reject_all("attached camera before TRACKING (initialization uses the keyframe "
+                           "camera)")
+                continue
+            j, t_j, E_j = min(candidates, key=lambda c: abs(c[1] - t))
+            if abs(t - t_j) > cfg.attach_max_dt:
+                reject_all(f"no keyframe within attach_max_dt ({cfg.attach_max_dt:g} s)")
+                continue
+            if j != k and not self.backend.exists(K.X(j)):
+                reject_all("anchor keyframe already marginalized")
+                continue
+            if self.dvl.extra_sigma(min(t, t_j), max(t, t_j)) > 0.0:
+                reject_all("DVL dropout or re-lock between the keyframe and the image")
+                continue
+            r.anchor_k = j
+            dets, sols = self._usable_detections(frame, r)
+            cam = self.cameras[frame.camera]
+            cam_at_anchor = dataclasses.replace(cam, T_bc=E_j.between(E_t).compose(cam.T_bc))
+            for d in dets:
+                tkey = self.tag_index.key(d.tag)
+                if not self.backend.exists(tkey) and not values.exists(tkey):
+                    values.insert(tkey, self.tags[d.tag].T_dock_tag)
+                    graph.add(pose_prior(tkey, self.tags[d.tag].T_dock_tag, mount_rot,
+                                         cfg.sigma_mount_trans))
+                    timestamps[tkey] = stamp
+                    log.info("tag %s entered the graph (attached camera)", tag_key_str(d.tag))
+                graph.add(TagProjectionFactor(
+                    K.X(j), K.S, tkey, cam_at_anchor, self.tags[d.tag], d.corners,
+                    cfg.sigma_px, cfg.tag_huber_k, cfg.min_projection_depth).factor)
+                r.accepted.append(d.tag)
+                r.tag_obs.append((d.tag, cam_at_anchor.T_bc.compose(sols[d.tag][0][0])))
+        return out
 
     # ======================================================================
     # Helpers for evaluation / outputs
@@ -300,7 +426,7 @@ class DockEstimator:
     # ======================================================================
     # Step 4: which detections are used
     # ======================================================================
-    def _usable_detections(self, frame: TagFrame, result: KeyframeResult
+    def _usable_detections(self, frame: TagFrame, result: "KeyframeResult | AttachedResult"
                            ) -> Tuple[List[Detection], Dict[TagKey, List[Solution]]]:
         """The frame's detections of station tags, with their IPPE solutions (best first).
 

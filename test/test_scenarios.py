@@ -198,3 +198,59 @@ def test_dvl_dropout_deweights_odometry():
     dt, dr = final_error(scn, res)
     assert dt < 0.02 and dr < math.radians(1.0)
 
+
+
+def test_attached_down_camera_takes_over_at_the_dock():
+    """cam_front loses the tags at the end of a pass over the station; cam_down (attached) sees
+    the bottom tags. Its factors enter the graph on the cam_front keyframes (no keyframes of
+    its own) and keep the docking pose at least as good as cam_front alone."""
+    base = dict(height=0.6, end_x=0.0)
+    alone_scn, _, alone = fly(ScenarioConfig(**base))
+    both_scn, _, both = fly(ScenarioConfig(**base, cameras=("cam_front", "cam_down")))
+    # Same keyframes: only cam_front's messages create them.
+    assert [r.stamp for r in both] == [r.stamp for r in alone]
+    attached = [a for r in both for a in r.attached]
+    accepted = [t for a in attached for t in a.accepted]
+    assert accepted and {t[1] for t in accepted} <= {176, 185, 541, 558}
+    assert all(a.anchor_k is not None for a in attached if a.accepted)
+    # Final dock error over the last 2 s, where cam_front is blind and the
+    # graph dead-reckons on the EKF alone (2.75 cm here) unless cam_down sees
+    # the bottom tags (0.35 cm).
+    t_alone, _ = final_error(alone_scn, alone)
+    t_both, _ = final_error(both_scn, both)
+    assert t_both < 0.5 * t_alone
+    assert t_both < 0.01
+
+
+def test_attached_camera_tags_enter_after_initialization():
+    """cam_front reports only the front tags, cam_down only the bottom tags (per-camera
+    camera_tag_ids). The station initializes from cam_front; the bottom tags' T_j are created
+    on cam_down's first sighting (URDF pose + mounting prior), with no initialization of their
+    own, and cam_down then holds the docking pose while cam_front is blind."""
+    tags = {"cam_front": [146, 541, 558], "cam_down": [176, 185]}
+    base = dict(height=0.6, end_x=0.0, camera_tags=tags)
+    alone_scn, _, alone = fly(ScenarioConfig(**base))
+    scn, est, res = fly(ScenarioConfig(**base, cameras=("cam_front", "cam_down")))
+    front = {d.tag[1] for f in scn.frames if f.camera == "cam_front" for d in f.detections}
+    assert front <= {146, 541, 558}
+    accepted = {t[1] for r in res for a in r.attached for t in a.accepted}
+    assert accepted == {176, 185}
+    assert {("36h11", 176), ("36h11", 185)} <= set(est.tag_estimates())
+    t_alone, _ = final_error(alone_scn, alone)
+    t_both, _ = final_error(scn, res)
+    assert t_both < 0.5 * t_alone and t_both < 0.01
+
+
+@pytest.mark.parametrize("offset", [-0.03, 0.02])
+def test_synced_down_camera_anchors_to_its_own_keyframe(offset):
+    """With cam_down's detector synced to cam_front (sync_to), each attached frame is anchored
+    to the cam_front keyframe nearest it, also when its image is slightly *earlier* (the
+    previous keyframe is 0.2 s back): the EKF only has to bridge |offset|."""
+    tags = {"cam_front": [146, 541, 558], "cam_down": [176, 185]}
+    scn, _, res = fly(ScenarioConfig(height=0.6, end_x=0.0, camera_tags=tags, sync_cameras=True,
+                                     sync_offset=offset, cameras=("cam_front", "cam_down")))
+    stamp = {r.k: r.stamp for r in res}
+    gaps = [a.stamp - stamp[a.anchor_k] for r in res for a in r.attached if a.accepted]
+    assert gaps and max(abs(g - offset) for g in gaps) < 1e-6
+    t, _ = final_error(scn, res)
+    assert t < 0.01

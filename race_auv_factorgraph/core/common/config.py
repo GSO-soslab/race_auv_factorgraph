@@ -101,6 +101,19 @@ class EstimatorConfig:
     seed_min_shift: float = 0.05
     seed_size_tol_px: float = 2.0
 
+    # ------------------------------------------------------------------ §6 attached cameras
+    # Detections of a camera other than the keyframe camera (node parameter
+    # keyframe_camera; e.g. cam_down) never create keyframes. Each one is
+    # attached to the keyframe X_j nearest its stamp t (before or after),
+    # through the EKF's motion in between: the factor sees the camera at
+    # X_j * (E_j^-1 E(t)) * T_bc (DockEstimator.add_attached_frame). Only the
+    # EKF's error over |t - t_j| enters: <= 33 ms with the detector synced to
+    # the keyframe camera (sync_to), up to a detector period without. A frame
+    # farther than this from its nearest keyframe is dropped (the keyframe
+    # camera is late or silent), and so is one whose interval contains a DVL
+    # dropout or re-lock (the EKF steps there).
+    attach_max_dt: float = 0.5
+
     # ------------------------------------------------------------------ §7 initialization
     # Hypotheses come from PnP. Keep only the better IPPE solution when its
     # reprojection error is below `ratio` times the other's (unambiguous view).

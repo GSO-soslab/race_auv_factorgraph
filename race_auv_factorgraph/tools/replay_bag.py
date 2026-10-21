@@ -180,13 +180,20 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
         the newest image every 0.2 s, i.e. every 3rd 15 Hz image.
         Re-published messages (same image stamp as the previous one) are
         removed *before* counting, so the stride counts distinct images.
+        Counted per camera.
+
+    Attached cameras (every enabled camera but ``keyframe_camera``) are fed
+    exactly as in the node: their frames are polled after the keyframes and
+    attached with ``DockEstimator.add_attached_frame``. Their results reach
+    ``on_keyframe`` through ``result.attached`` of the next keyframe.
     """
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
 
     load_camera_info(bag, setup)
     est = DockEstimator(cfg or setup.cfg, setup.cameras, setup.tags, setup.T_dock_base)
-    sched = KeyframeScheduler(ekf_buffer_seconds=float(get("ekf_buffer_seconds")))
+    sched = KeyframeScheduler(ekf_buffer_seconds=float(get("ekf_buffer_seconds")),
+                              attached_cameras=setup.attached_cameras)
     odom_topic = get("odom_topic")
     cam_by_topic = {topic: cam for cam, topic in setup.camera_topics.items()}
     reader = _open_reader(bag)
@@ -203,8 +210,8 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
     msg_cls = {name: get_message(types[name]) for name in types
                if name in (odom_topic, gt_topic, dvl_topic, *cam_by_topic)}
 
-    n_images = 0                     # distinct detector images seen (for frame_stride)
-    last_image_stamp = None
+    n_images: Dict[str, int] = {}    # distinct detector images seen per camera (frame_stride)
+    last_image_stamp: Dict[str, float] = {}
     frame_count = 0                  # detector messages fed to the scheduler (for holdout)
     holdout_dets: Dict[float, List[Detection]] = {}
     while reader.has_next():
@@ -232,11 +239,12 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
             cam = cam_by_topic[topic]
             t = _stamp(msg)
             if frame_stride > 1:
-                if last_image_stamp is not None and t <= last_image_stamp:
+                last = last_image_stamp.get(cam)
+                if last is not None and t <= last:
                     continue  # re-published image: does not count towards the stride
-                last_image_stamp = t
-                n_images += 1
-                if (n_images - 1) % frame_stride != 0:
+                last_image_stamp[cam] = t
+                n_images[cam] = n_images.get(cam, 0) + 1
+                if (n_images[cam] - 1) % frame_stride != 0:
                     continue  # a slower detector would never have processed this image
             dets, held = [], []
             frame_count += 1
@@ -257,6 +265,8 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
             res = est.process_keyframe(kf.stamp, kf.E, kf.frame)
             if on_keyframe is not None:
                 on_keyframe(est, res, holdout_dets.pop(res.stamp, []))
+        for af in sched.poll_attached():
+            est.add_attached_frame(af.stamp, af.E, af.frame)
     return est, sched
 
 

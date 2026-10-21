@@ -18,9 +18,12 @@ Inputs
     on its ``apriltag_detection/tags`` topic. The corners must be in the
     **rectified** image, in the canonical order (see
     ``core/common/model.py:tag_corner_points``). ``header.stamp`` is the image stamp.
-    One camera only. Every message, also one without detections, becomes
-    one keyframe at that stamp: the detector's ``publish_rate`` (5 Hz on the
-    vehicle) is the graph's keyframe rate.
+    One topic per enabled camera of ``camera_names``. Every message of the
+    ``keyframe_camera``, also one without detections, becomes one keyframe
+    at that stamp: its detector's ``publish_rate`` (5 Hz on the vehicle) is
+    the graph's keyframe rate. Messages of the other (attached) cameras that
+    contain tags are attached to those keyframes instead
+    (``DockEstimator.add_attached_frame``); they never create keyframes.
 
 Timing: only header stamps are used, never arrival times, so zenoh latency
 between the front-seat computer (EKF) and the Jetson (camera, detector,
@@ -33,7 +36,10 @@ TF ``graph_frame -> station_base_frame`` (e.g. ``race_auv/odom -> race_station/b
     ``E_k * X_k^-1 * S * T_dock_base``, published at the EKF rate with each
     EKF message's stamp. Composed with the EKF's ``odom -> base_link`` this
     gives ``base_link -> station = X_k^-1 * S * T_dock_base``, the graph's
-    drift-corrected relative pose. Corrections are rate-limited.
+    drift-corrected relative pose. The graph's corrections to that relative
+    pose are rate-limited; an EKF snap (DVL re-lock) is not, it passes
+    straight into this edge so ``base_link -> station`` stays right
+    (:class:`StationTfLimiter`).
 TF ``station_base_frame -> dock_frame`` (static, optional)
     From the station URDF, so ``dock_point`` exists even when the station's
     own ``robot_state_publisher`` is not running.
@@ -49,6 +55,24 @@ TF ``dock_frame -> <station prefix>/apriltag<family>_<id>`` (with the static TF)
     tracking. The covariance is that of the docking pose itself
     (``estimator.covariance_mode``, default "relative"), expressed along the
     ``base_frame`` axes in ROS order.
+``compat_pose_topic`` (``geometry_msgs/PoseStamped``, optional)
+    Drop-in for the old ``apriltag_fuser``'s ``/race_station/dock_point/pose``:
+    dock_point in ``base_frame``, with the old *detection* meaning. Published
+    only on keyframes that added at least one tag factor (keyframe camera or
+    attached), so it is silent while no tag is seen, like the old fuser;
+    the docking mission counts these messages as detections. The value is
+    the graph's docking pose ``X_k^-1 S`` moved to the newest EKF stamp by
+    the EKF's motion since the keyframe (``compat_dock_pose``; not during a
+    DVL dropout, when the EKF steps); it is not rate-limited (the TF is:
+    after an EKF snap they differ for a few s).
+    The continuous estimate (also while blind) stays on the TF and
+    ``dock_pose_topic``.
+TF ``graph_frame -> corrected_frame`` (optional, e.g. ``race_auv/odom -> race_auv/odom_graph``)
+    ``E_k * X_k^-1`` (the inverse drift correction of the latest keyframe),
+    at the EKF rate, not rate-limited. ``base_link`` then sits at the
+    graph's ``X_k`` in ``corrected_frame`` and the station is fixed there:
+    the display frame for Foxglove / RViz (the EKF's odom drifts during a
+    DVL dropout, and the station TF drifts with it).
 ``/diagnostics`` (``diagnostic_msgs/DiagnosticArray``)
     Station state, accepted/rejected tags, update time, init progress.
 
@@ -63,6 +87,9 @@ Debug outputs (``publish_debug: true``), one message per keyframe
     The same ``X_k`` as ``~/auv_pose``, as Odometry so it sits next to the
     EKF's ``odom_topic`` in Foxglove / RViz (pose trail, x-y plot). Twist
     and covariance are not estimated and left all zero.
+``~/path_graph`` (``nav_msgs/Path``, ``corrected_frame``, only with ``corrected_frame``)
+    The same poses as ``~/path``, stamped in ``corrected_frame``, so the
+    track lines up with the AUV model when that frame is the display frame.
 ``~/path``, ``~/ekf_path`` (``nav_msgs/Path``, ``graph_frame``)
     The last ``path_length`` keyframes of the graph's real-time ``X_k`` and of
     the EKF ``E_k`` at the same stamps, published at ``path_rate`` Hz (not
@@ -74,6 +101,9 @@ Debug outputs (``publish_debug: true``), one message per keyframe
     "rejected": [[tag, reason]], "initialized_now", "recovered",
     "seeded_from_tag", "dvl_sigma", "init_note", "update_ms"}``. ``rejected``
     are detections that could not be used (tag not on the station, PnP failed).
+    With attached cameras also ``"attached": [{"camera", "stamp", "anchor_k",
+    "accepted", "rejected"}]``: the attached frames whose factors entered
+    with this keyframe.
 """
 
 from __future__ import annotations
@@ -134,6 +164,94 @@ def _sec_to_stamp(t: float):
     return Time(sec=sec, nanosec=int(round((t - sec) * 1e9)) % 1_000_000_000)
 
 
+def compat_dock_pose(E_k: gtsam.Pose3, E_t: gtsam.Pose3, dock_k: gtsam.Pose3) -> gtsam.Pose3:
+    """dock_point in base_link at EKF time t, from the graph's docking pose at keyframe k.
+
+    ``(E_k^-1 E(t))^-1 * X_k^-1 S``: the keyframe's docking pose moved by the
+    AUV's motion since then, as the EKF measured it. Only the EKF's
+    *relative* motion over ``t - t_k`` (one EKF period to a few) enters, so
+    an EKF snap (DVL re-lock) cancels out. Deliberately not taken from the
+    station TF: that one is rate-limited in odom, and after an EKF snap its
+    ``base_link -> dock_point`` lags by the snap for seconds (1.65 m over
+    ~3.4 s on the 10-20 tank run).
+    """
+    return E_k.between(E_t).inverse().compose(dock_k)
+
+
+def corrected_frame_transform(res: KeyframeResult) -> gtsam.Pose3:
+    """``graph_frame -> corrected_frame`` = ``E_k X_k^-1``: base_link sits at ``X_k`` in it."""
+    return res.drift_correction.inverse()
+
+
+class StationTfLimiter:
+    """Rate limit for the TF ``odom -> station``, applied to the relative pose, not to odom.
+
+    The limit is there so the docking controller never sees the graph's
+    estimate jump (a tag back after a gap moves ``X_k^-1 S``). It must not
+    slow down an EKF snap: when the DVL re-locks, the EKF's ``odom ->
+    base_link`` jumps (1.65 m on the 10-20 tank run) while the AUV and the
+    relative pose do not move. Limiting ``odom -> station`` in odom turned
+    that snap into a slow slew, and ``base_link -> station`` was off by the
+    snap for seconds (1.84 m, ~3.4 s).
+
+    So the limited quantity is ``base_link -> station`` itself:
+
+    * target at EKF time t: the keyframe's ``X_k^-1 S T_dock_base``, moved by
+      the EKF's motion since the keyframe, ``(E_k^-1 E(t))^-1 * rel_k``;
+    * published relative pose: the previous one moved by the EKF's motion
+      since the previous message, stepped toward the target by at most the
+      rate limit;
+    * published TF: ``E(t) * relative``.
+
+    In steady state that is exactly ``E_k X_k^-1 S T_dock_base``. Where the
+    EKF's increments are not to be trusted (``ekf_reliable=False``: the DVL
+    monitor flags a dropout or re-lock in the step), the published relative
+    pose takes the target directly: a snap then lands in the odom edge at
+    once and the relative pose stays continuous.
+    """
+
+    def __init__(self, max_trans_rate: float, max_rot_rate: float) -> None:
+        self.max_trans_rate = float(max_trans_rate)
+        self.max_rot_rate = float(max_rot_rate)
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget everything (station lost); the next value is taken as is."""
+        self._E_k: Optional[gtsam.Pose3] = None     # EKF pose at the latest keyframe
+        self._rel_k: Optional[gtsam.Pose3] = None   # base_link -> station at that keyframe
+        self._rel: Optional[gtsam.Pose3] = None     # published base_link -> station
+        self._E_last: Optional[gtsam.Pose3] = None
+        self._t_last: Optional[float] = None
+
+    @property
+    def active(self) -> bool:
+        return self._rel_k is not None
+
+    @property
+    def last_stamp(self) -> Optional[float]:
+        """EKF stamp of the previous :meth:`update`."""
+        return self._t_last
+
+    def set_target(self, E_k: gtsam.Pose3, rel_k: gtsam.Pose3, jump: bool = False) -> None:
+        """A new keyframe: its EKF pose and ``X_k^-1 S T_dock_base``. ``jump``: no limiting now."""
+        self._E_k, self._rel_k = E_k, rel_k
+        if jump:
+            self._rel = None
+
+    def update(self, t: float, E_t: gtsam.Pose3, ekf_reliable: bool = True) -> gtsam.Pose3:
+        """``odom -> station`` to publish with the EKF message at ``t`` (pose ``E_t``)."""
+        target = self._E_k.between(E_t).inverse().compose(self._rel_k)
+        if self._rel is None or self._E_last is None or not ekf_reliable:
+            self._rel = target
+        else:
+            dt = max(0.0, t - self._t_last)
+            pred = self._E_last.between(E_t).inverse().compose(self._rel)
+            self._rel = step_towards(pred, target, self.max_trans_rate * dt,
+                                     self.max_rot_rate * dt)
+        self._E_last, self._t_last = E_t, t
+        return E_t.compose(self._rel)
+
+
 class _RosLogHandler(logging.Handler):
     """Forward Python ``logging`` records from ``core/`` to the node's ROS logger."""
 
@@ -191,12 +309,12 @@ class DockFuserNode(Node):
         self.estimator = DockEstimator(cfg, self.cameras, self.tags, self.T_dock_base)
         # One keyframe per detector message, released once the EKF covers its
         # stamp (see core/frontend/scheduler.py for the timing rules).
-        self.scheduler = KeyframeScheduler(ekf_buffer_seconds=float(g("ekf_buffer_seconds")))
+        self.scheduler = KeyframeScheduler(ekf_buffer_seconds=float(g("ekf_buffer_seconds")),
+                                           attached_cameras=setup.attached_cameras)
 
         # ================================================================ output state
-        self._target: Optional[gtsam.Pose3] = None     # latest odom -> station base from the graph
-        self._published: Optional[gtsam.Pose3] = None  # rate-limited value actually published
-        self._last_tf_stamp: Optional[float] = None
+        # odom -> station base: rate-limited in base_link, EKF snaps pass through.
+        self._station_tf = StationTfLimiter(self.max_trans_rate, self.max_rot_rate)
         self._last_state = self.estimator.state
         self._unknown_tags: Dict[str, int] = {}
         self._last_result: Optional[KeyframeResult] = None
@@ -209,6 +327,10 @@ class DockFuserNode(Node):
         # ================================================================ ROS I/O
         self.tf_pub = TransformBroadcaster(self)
         self.dock_pub = self.create_publisher(PoseWithCovarianceStamped, g("dock_pose_topic"), 10)
+        self.compat_topic = str(g("compat_pose_topic") or "")
+        self.compat_pub = (self.create_publisher(PoseStamped, self.compat_topic, 10)
+                           if self.compat_topic else None)
+        self.corrected_frame = str(g("corrected_frame") or "")
         self.diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
         self.debug = bool(g("publish_debug"))
         if self.debug:
@@ -223,6 +345,9 @@ class DockFuserNode(Node):
             n = int(g("path_length"))
             self._path_X: deque = deque(maxlen=n)
             self._path_E: deque = deque(maxlen=n)
+            self.dbg_path_graph_pub = (self.create_publisher(Path, "~/path_graph", 1)
+                                       if self.corrected_frame else None)
+            self._path_G: deque = deque(maxlen=n)
             self._path_dirty = False
             self.create_timer(1.0 / float(g("path_rate")), self._publish_paths)
         # Tag frames: dock_point's prefix + the URDF link name.
@@ -261,9 +386,16 @@ class DockFuserNode(Node):
         # the moment the scheduler can release them (see _process).
         self.create_timer(1.0, self._publish_diagnostics)
 
+        roles = ", ".join([f"{setup.keyframe_camera} (keyframes)"]
+                          + [f"{c} (attached)" for c in setup.attached_cameras])
         self.get_logger().info(
-            f"dock_fuser ready: fixed-lag {cfg.smoother_lag:g} s, {len(setup.camera_topics)} cameras, "
+            f"dock_fuser ready: fixed-lag {cfg.smoother_lag:g} s, cameras {roles}, "
             f"tags {[tag_key_str(k) for k in self.tags]}, odom={g('odom_topic')}")
+        if self.compat_pub is not None:
+            self.get_logger().info(f"detection-style dock pose (PoseStamped) on {self.compat_topic}")
+        if self.corrected_frame:
+            self.get_logger().info(f"graph-corrected frame: TF {self.graph_frame} -> "
+                                   f"{self.corrected_frame}")
 
     # ==================================================================== callbacks
     def _dvl_cb(self, msg: TwistWithCovarianceStamped) -> None:
@@ -281,9 +413,11 @@ class DockFuserNode(Node):
         t = _stamp_to_sec(msg.header.stamp)
         self._ekf_seen = (self._now(), t)
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
-        self.scheduler.add_odometry(t, pose_from_quat_xyzw((p.x, p.y, p.z), (q.x, q.y, q.z, q.w)))
+        E = pose_from_quat_xyzw((p.x, p.y, p.z), (q.x, q.y, q.z, q.w))
+        self.scheduler.add_odometry(t, E)
         self._process()
-        self._publish_station_tf(t, msg.header.stamp)
+        self._publish_station_tf(t, E, msg.header.stamp)
+        self._publish_corrected_tf(msg.header.stamp)
 
     def _detections_cb(self, camera: str, msg: AprilTagDetectionArray) -> None:
         """Convert one detector message into a TagFrame and queue it as a keyframe.
@@ -354,6 +488,13 @@ class DockFuserNode(Node):
             self._handle_result(res)
             if self.debug:
                 self._publish_debug(res, kf.frame.camera, len(kf.frame.detections))
+        # Attached cameras after the keyframes, so each anchor already exists.
+        for af in self.scheduler.poll_attached():
+            try:
+                self.estimator.add_attached_frame(af.stamp, af.E, af.frame)
+            except Exception as e:
+                self.get_logger().error(f"attached frame ({af.frame.camera}) at {af.stamp:.3f} "
+                                        f"failed: {e!r}")
 
     # ==================================================================== outputs
     def _handle_result(self, res: KeyframeResult) -> None:
@@ -361,15 +502,16 @@ class DockFuserNode(Node):
         if res.state != self._last_state:
             self.get_logger().info(f"station state {self._last_state.value} -> {res.state.value}")
             self._last_state = res.state
-        if res.initialized_now:
-            self._published = None  # first value: jump, do not rate-limit from nothing
         if res.state != StationState.TRACKING or res.S is None:
             if res.state != StationState.TRACKING:
-                self._target = self._published = None
+                self._station_tf.reset()
             return
 
-        # odom -> station base = E_k * X_k^-1 * S * T_dock_base = D^-1 * S * T_dock_base (§10)
-        self._target = res.drift_correction.inverse().compose(res.S).compose(self.T_dock_base)
+        # odom -> station base = E_k * X_k^-1 * S * T_dock_base (§10), limited on
+        # base_link -> station = X_k^-1 * S * T_dock_base. The first value
+        # (just initialized) is taken as is.
+        self._station_tf.set_target(res.E, res.dock_in_base.compose(self.T_dock_base),
+                                    jump=res.initialized_now)
         self._publish_tag_tf(res.stamp)
 
         # /dock_point/pose: X_k^-1 * S in base_link, with the docking-pose covariance.
@@ -387,13 +529,40 @@ class DockFuserNode(Node):
         else:
             msg.pose.covariance = [-1.0] + [0.0] * 35  # ROS convention: covariance unknown
         self.dock_pub.publish(msg)
+        if self.compat_pub is not None and (res.accepted or res.n_attached_accepted):
+            self._publish_compat_pose(res)
+
+    def _publish_compat_pose(self, res: KeyframeResult) -> None:
+        """Detection-style dock pose: base_frame -> dock_frame at the newest EKF stamp.
+
+        Moved forward by the EKF's motion since the keyframe, except while
+        the DVL has no bottom lock in between: the EKF then dead-reckons in
+        steps (6-17 cm per message on the 10-20 run, then the re-lock snap),
+        so the keyframe's own docking pose, at the keyframe stamp, is better.
+        """
+        if res.dock_in_base is None:
+            return
+        t = self.scheduler.ekf.newest_stamp
+        E = None if t is None else self.scheduler.ekf.interpolate(t)
+        if E is None or self.estimator.dvl.extra_sigma(res.stamp, t) > 0.0:
+            t, dock = res.stamp, res.dock_in_base
+        else:
+            dock = compat_dock_pose(res.E, E, res.dock_in_base)
+        msg = PoseStamped()
+        msg.header.stamp = _sec_to_stamp(t)
+        msg.header.frame_id = self.base_frame
+        p = dock.translation()
+        msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = map(float, p)
+        o = msg.pose.orientation
+        o.x, o.y, o.z, o.w = quat_xyzw(dock)
+        self.compat_pub.publish(msg)
 
     def _publish_debug(self, res: KeyframeResult, camera: str, n_tags: int) -> None:
         """Per-keyframe analysis topics (see the module docstring)."""
-        def pose_msg(T: gtsam.Pose3) -> PoseStamped:
+        def pose_msg(T: gtsam.Pose3, frame: str = self.graph_frame) -> PoseStamped:
             m = PoseStamped()
             m.header.stamp = _sec_to_stamp(res.stamp)
-            m.header.frame_id = self.graph_frame
+            m.header.frame_id = frame
             t = T.translation()
             m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, t)
             o = m.pose.orientation
@@ -412,6 +581,8 @@ class DockFuserNode(Node):
         self.dbg_odom_pub.publish(odom)
         self._path_X.append(X_msg)
         self._path_E.append(pose_msg(res.E))
+        if self.dbg_path_graph_pub is not None:
+            self._path_G.append(pose_msg(res.X, self.corrected_frame))
         self._path_dirty = True
         if res.S is not None:
             self.dbg_station_pub.publish(pose_msg(res.S))
@@ -428,6 +599,11 @@ class DockFuserNode(Node):
             "dvl_sigma": round(res.dvl_extra_sigma, 4),
             "init_note": res.init_note,
             "update_ms": round(res.update_time * 1000.0, 3),
+            **({"attached": [{"camera": a.camera, "stamp": a.stamp, "anchor_k": a.anchor_k,
+                              "accepted": [tag_key_str(t) for t in a.accepted],
+                              "rejected": [[tag_key_str(t), r] for t, r in a.rejected]}
+                             for a in res.attached]}
+               if self.setup.attached_cameras else {}),
         })))
 
     def _publish_paths(self) -> None:
@@ -435,10 +611,14 @@ class DockFuserNode(Node):
         if not self._path_dirty:
             return
         self._path_dirty = False
-        for pub, poses in ((self.dbg_path_pub, self._path_X), (self.dbg_ekf_path_pub, self._path_E)):
+        paths = [(self.dbg_path_pub, self._path_X, self.graph_frame),
+                 (self.dbg_ekf_path_pub, self._path_E, self.graph_frame)]
+        if self.dbg_path_graph_pub is not None:
+            paths.append((self.dbg_path_graph_pub, self._path_G, self.corrected_frame))
+        for pub, poses, frame in paths:
             msg = Path()
             msg.header.stamp = poses[-1].header.stamp     # newest keyframe
-            msg.header.frame_id = self.graph_frame
+            msg.header.frame_id = frame
             msg.poses = list(poses)
             pub.publish(msg)
 
@@ -453,19 +633,24 @@ class DockFuserNode(Node):
                          ros_stamp)
             for tag, frame in self._tag_frames.items()])
 
-    def _publish_station_tf(self, t: float, stamp) -> None:
-        """Publish ``graph_frame -> station_base_frame``, rate-limited toward the graph's value."""
-        if self._target is None:
+    def _publish_station_tf(self, t: float, E: gtsam.Pose3, stamp) -> None:
+        """Publish ``graph_frame -> station_base_frame`` with this EKF message (StationTfLimiter)."""
+        lim = self._station_tf
+        if not lim.active:
             return
-        if self._published is None:
-            self._published = self._target
-        elif self._last_tf_stamp is not None:
-            dt = max(0.0, t - self._last_tf_stamp)
-            self._published = step_towards(self._published, self._target,
-                                           self.max_trans_rate * dt, self.max_rot_rate * dt)
-        self._last_tf_stamp = t
-        self.tf_pub.sendTransform(self._tf_msg(self._published, self.graph_frame,
+        # The EKF's step since the previous message is not trusted across a
+        # DVL dropout / re-lock (it can be the snap itself).
+        reliable = (lim.last_stamp is None
+                    or self.estimator.dvl.extra_sigma(lim.last_stamp, t) == 0.0)
+        self.tf_pub.sendTransform(self._tf_msg(lim.update(t, E, reliable), self.graph_frame,
                                                self.station_base_frame, stamp))
+
+    def _publish_corrected_tf(self, stamp) -> None:
+        """``graph_frame -> corrected_frame`` = ``E_k X_k^-1`` of the latest keyframe (not rate-limited)."""
+        if not self.corrected_frame or self._last_result is None:
+            return
+        self.tf_pub.sendTransform(self._tf_msg(corrected_frame_transform(self._last_result),
+                                               self.graph_frame, self.corrected_frame, stamp))
 
     @staticmethod
     def _tf_msg(T: gtsam.Pose3, parent: str, child: str, stamp) -> TransformStamped:
@@ -531,6 +716,17 @@ class DockFuserNode(Node):
         if stalled:
             st.level = DiagnosticStatus.WARN
             st.message = f"{est.state.value}; no {' / '.join(stalled)} messages for > {_STALL_S:g} s"
+        # The old apriltag_fuser publishes the same topic (and a second parent
+        # for dock_frame): the two pipelines must not run together.
+        if self.compat_pub is not None and self.count_publishers(self.compat_topic) > 1:
+            st.level = DiagnosticStatus.ERROR
+            st.message = (f"another node also publishes {self.compat_topic} (old apriltag_fuser "
+                          "running?)")
+            self.get_logger().error(st.message, throttle_duration_sec=10.0)
+        if self.setup.attached_cameras and res is not None:
+            kv["attached_cameras"] = ", ".join(self.setup.attached_cameras)
+            kv["last_attached_accepted"] = ", ".join(
+                f"{a.camera}:{tag_key_str(t)}" for a in res.attached for t in a.accepted)
         missing = self.setup.missing_intrinsics()
         if missing:
             st.level = DiagnosticStatus.WARN
