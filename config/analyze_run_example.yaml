@@ -1,0 +1,67 @@
+# analyze_run parameters (tools/analyze_run.py):
+#   python3 race_auv_factorgraph/tools/analyze_run.py config/analyze_run_example.yaml
+# Copy this file per recording. Only bag and dock_fuser_config are required;
+# every other key has the default shown in analyze_run.DEFAULTS.
+#
+# Tank test 2026-10-20, dock guidance: the vehicle ran dock_fuser live
+# (fixed-lag smoother, 30 s) with publish_debug on, so the bag holds its
+# real-time estimates next to the EKF and the detector output.
+
+bag: ~/ros2bag/race/tank_test_dock_guidance_10_20_26/rosbag2_2026_10_20-21_38_00
+out_dir: ""                    # default: <bag>/analysis
+title: ""                      # default: the bag name
+
+# The parameter files the live node ran with, in launch order
+# (race_auv_bringup/launch/include/dock_fuser.launch.py). The batch graph is
+# rebuilt with them, so they must match the live run.
+dock_fuser_config:
+  - package://race_auv_bringup/config/station_tags.yaml
+  - package://race_auv_bringup/config/dock_fuser.yaml
+
+# Merged on top of the files above. The live node ran with tag 54 only
+# ("dock_fuser ready: ... tags ['36h11:54']" in /rosout), while
+# station_tags.yaml now lists all six station tags.
+dock_fuser_overrides:
+  tag_ids: [54]
+  tag_sizes: [0.22]            # black square
+
+# Seconds into the recording. The replay (and so the LM graph) starts fresh
+# at start: use the time the live node started (0 if it started with the bag),
+# or the live and replayed estimates differ.
+start: null
+end: null
+view_start: null               # draw only from here on (e.g. 120 to skip the approach)
+view_end: null                 # ... up to here (replay and LM still cover start..end)
+frame_stride: 1                # the detector ran at 5 Hz live: every message is a keyframe
+
+topics:
+  ekf: /race_auv/odometry/filtered
+  dvl: null                    # null: the config's dvl_topic (dropouts shaded), "": off
+  auv_pose: /dock_fuser/auv_pose
+  station_pose: /dock_fuser/station_pose
+  keyframe: /dock_fuser/keyframe
+
+batch:
+  enabled: true
+  max_iterations: 100
+
+timing:
+  enabled: true
+  live_label: Jetson Orin Nano Super (25 W)
+  replay: false                # true: also time the replay on this computer (slower)
+
+# Boxed on the overview, shaded on the time panels; graph: true also draws
+# that window's factor graph (graph_<label>.png). Keep them a few seconds.
+windows:
+  - {label: A, from: 148.0, to: 153.0, graph: true}   # station initialized at 150.6 s
+  - {label: B, from: 218.0, to: 222.0, graph: true}   # tag back, X_k seeded 1.65 m from odometry
+
+outputs:
+  overview: true
+  rt_vs_batch: true
+  graphs: true
+  csv: true
+
+side_views: [yz]               # side views next to the bird's-eye view, e.g. [yz, xz]
+
+dpi: 150
