@@ -5,7 +5,8 @@ The node needs three things from URDFs (§3):
 * ``T_bc`` for each camera, from the AUV URDF (``base_link -> cam_front`` ...).
 * The pose of every tag relative to ``dock_point``, from the station URDF.
 * ``T_dock_base``: the station ``base_link`` expressed in ``dock_point``,
-  so the node can publish ``odom -> station base_link`` (§10).
+  so the node can publish the station's TF frame (``odom_graph -> station
+  base_link``, §10).
 
 Only ``<joint>`` origins are used. Every joint is taken at its zero position,
 so a chain through a moving joint is evaluated at that joint's zero
@@ -19,7 +20,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import gtsam
 
@@ -105,11 +106,6 @@ class Urdf:
                 out[(m.group("family"), int(m.group("id")))] = link
         return out
 
-    def tag_poses(self, frame: str, families: Optional[List[str]] = None
-                  ) -> Dict[TagKey, gtsam.Pose3]:
+    def tag_poses(self, frame: str) -> Dict[TagKey, gtsam.Pose3]:
         """Pose of every tag link in ``frame`` (normally ``dock_point``)."""
-        return {
-            key: self.transform(frame, link)
-            for key, link in self.tag_links().items()
-            if families is None or key[0] in families
-        }
+        return {key: self.transform(frame, link) for key, link in self.tag_links().items()}

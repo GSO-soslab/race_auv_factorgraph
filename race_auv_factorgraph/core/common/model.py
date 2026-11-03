@@ -48,7 +48,7 @@ def tag_corner_points(size: float) -> np.ndarray:
     detector places the corners, not at the outer white border.
 
     The order is the canonical corner order used everywhere in this package
-    (and published by ``apriltag_detector_node`` on its ``tags`` topic):
+    (and published by the tag detector, ``tag_detector_node``, on its ``tags`` topic):
 
     ====== ====================== ==============================
     index  tag-frame point        meaning (tag frame: x right,
@@ -162,14 +162,6 @@ class Detection:
         """Area of the corner quadrilateral in px^2 (shoelace formula)."""
         x, y = self.corners[:, 0], self.corners[:, 1]
         return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-    def min_side_px(self) -> float:
-        """Length (px) of the shortest of the 4 sides of the corner quadrilateral.
-
-        PnP range noise scales with its inverse (range ~ f * size / side).
-        """
-        c = self.corners
-        return float(np.min(np.linalg.norm(c - np.roll(c, -1, axis=0), axis=1)))
 
 
 @dataclass

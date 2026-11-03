@@ -4,10 +4,11 @@ Factor-graph estimators for the RACE AUV. Used as a submodule of [race_auv](http
 
 ## Package
 
-The repository root is the `race_auv_factorgraph` ament_python package. Its `dock_fuser_node` runs the gtsam fixed-lag smoother graph that estimates the docking station pose from AprilTag corner detections and the `robot_localization` EKF odometry. Publishes `odom → station` TF and `/dock_point/pose`. Status: implemented; tested on synthetic data and the live node. See the design doc §12 for what is left.
+The repository root is the `race_auv_factorgraph` ament_python package. Its node `/race_auv/race_auv_factorgraph` (executable `factorgraph_node`) runs the gtsam fixed-lag smoother graph that estimates the docking station pose and the drift-corrected AUV pose from AprilTag corner detections and the `robot_localization` EKF odometry. It publishes the AUV pose in `race_auv/odom_graph` at the EKF rate, the station state and pose, and the TF frames. Status: implemented; tested on synthetic data, tank recordings and the live node. See the design doc §12 for what is left.
 
 ## Docs
 
+- [docs/ROS_INTERFACE.md](docs/ROS_INTERFACE.md): the node's topics, frames and messages, the architecture around it, Foxglove setup, and the mapping from the former `dock_fuser` topics.
 - [docs/DOCK_FUSER_PIPELINE.md](docs/DOCK_FUSER_PIPELINE.md): full pipeline design (factors, initialization, detections used, backend, output, build order).
 - [docs/DOCK_FUSER_FACTOR_GRAPH.md](docs/DOCK_FUSER_FACTOR_GRAPH.md): example factor graph.
 
@@ -21,7 +22,7 @@ The repository root is the `race_auv_factorgraph` ament_python package. Its `doc
 
 ```bash
 cd ~/ros2_ws
-colcon build --packages-select race_auv_factorgraph
+colcon build --packages-select race_auv_msgs race_auv_factorgraph
 colcon test --packages-select race_auv_factorgraph
 ```
 

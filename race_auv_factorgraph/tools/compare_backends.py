@@ -3,12 +3,12 @@
 Usage::
 
     ros2 run race_auv_factorgraph compare_backends DETECTION_BAG \\
-        --config tank_dock_fuser.yaml --out /path/to/report \\
+        --config tank_factorgraph.yaml --out /path/to/report \\
         [--variants fixed_lag:30 fixed_lag:60] [--reference fixed_lag:30]
         [--max-wall fixed_lag:60=900] [--start 30 --end 420]
 
 ``DETECTION_BAG`` needs the EKF odometry and the corner-detection topics, e.g.
-the output of ``bag_test.launch.py ... run_fuser:=false record_images:=false``.
+the output of ``bag_test.launch.py ... run_graph:=false record_images:=false``.
 
 What is compared
 ----------------
@@ -40,7 +40,7 @@ switched off in every variant (``covariance_mode: none``) so that the update
 times measure the estimator alone.
 
 Outputs (in ``--out``): ``comparison.png`` (full and zoomed BEV, drift
-correction, docking-pose difference to LM, update time, tag/seed/DVL-dropout
+correction, docking-pose difference to LM, update time, tag/init-jump/DVL-dropout
 raster, blind periods shaded), ``summary.txt``, ``summary.csv``, and
 ``meta.json`` plus one ``variant_<name>.npz`` per variant. ``--replot``
 redraws from those without replaying.
@@ -89,13 +89,14 @@ def run_variant(bag: str, config, name: str, overrides: dict, batch: bool,
     """
     from ..core.init.state_machine import StationState
     from ..ros.params import build_setup, getter_from_yaml
+    from .bag import INIT_JUMP_M
     from .replay_bag import replay
 
     get = getter_from_yaml(config)
     setup = build_setup(get, lambda m: None)
     cfg = dataclasses.replace(setup.cfg, covariance_mode="none", **overrides)
     rec = {k: [] for k in ("k", "stamp", "X", "E", "S", "has_S", "update_ms", "n_acc",
-                           "n_rej", "seeded", "tagframe", "init", "dvl_sigma")}
+                           "n_rej", "init_jump", "tagframe", "init", "dvl_sigma")}
     t_start = time.perf_counter()
     last_print = [t_start]
 
@@ -109,7 +110,7 @@ def run_variant(bag: str, config, name: str, overrides: dict, batch: bool,
         rec["update_ms"].append(res.update_time * 1000.0)
         rec["n_acc"].append(len(res.accepted))
         rec["n_rej"].append(len(res.rejected))
-        rec["seeded"].append(res.seeded_from_tag)
+        rec["init_jump"].append(res.init_shift >= INIT_JUMP_M)
         rec["tagframe"].append(bool(res.accepted or res.rejected)
                                or res.initialized_now)
         rec["init"].append(res.initialized_now)
@@ -196,7 +197,7 @@ def analyse(results: List[dict], ref: dict) -> Tuple[List[dict], Dict[str, dict]
             "tag_kf_accepted": int((r["n_acc"] > 0).sum()),
             "tag_kf_rejected": int(((r["n_rej"] > 0) & (r["n_acc"] == 0)).sum()),
             "tags_rejected": int(r["n_rej"].sum()),
-            "seeded_from_tag": int(_seeded(r).sum()),
+            "init_jumps": int(_init_jump(r).sum()),
             "recoveries": int(r["n_recoveries"]),
             "update_ms_median": q(u, 50), "update_ms_p95": q(u, 95),
             "update_ms_p99": q(u, 99), "update_ms_max": float(u.max()),
@@ -225,12 +226,12 @@ def tag_observations(bag: str, setup, start, end) -> Dict[float, Tuple[str, np.n
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
 
-    from ..core.common.model import Detection, normalize_family
     from ..core.frontend.pnp import ippe_tag
-    from .replay_bag import _open_reader
+    from ..ros.msgs import stamp_to_sec, tag_detections
+    from .bag import open_reader, source_start_time
 
-    reader = _open_reader(bag)
-    t_bag0 = reader.get_metadata().starting_time.nanoseconds * 1e-9
+    reader = open_reader(bag)
+    t_bag0 = source_start_time(bag)                  # times: seconds into the recording
     cam_by_topic = {topic: cam for cam, topic in setup.camera_topics.items()}
     types = {t.name: t.type for t in reader.get_all_topics_and_types()}
     cls = {t: get_message(types[t]) for t in cam_by_topic if t in types}
@@ -244,15 +245,10 @@ def tag_observations(bag: str, setup, start, end) -> Dict[float, Tuple[str, np.n
             continue
         msg = deserialize_message(data, cls[topic])
         cam = setup.cameras[cam_by_topic[topic]]
-        for d in msg.detections:
-            key = (normalize_family(d.family), int(d.id))
-            if key not in setup.tags:
-                continue
-            det = Detection(cam.name, key, np.array([[c.x, c.y] for c in d.corners], dtype=float))
-            sols = ippe_tag(det, cam, setup.tags[key])
+        for det in tag_detections(cam.name, msg, setup.tags)[0]:
+            sols = ippe_tag(det, cam, setup.tags[det.tag])
             if sols:
-                stamp = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
-                out[round(stamp, 6)] = (cam.name, sols[0][0].translation())
+                out[round(stamp_to_sec(msg.header.stamp), 6)] = (cam.name, sols[0][0].translation())
             break
     return out
 
@@ -261,16 +257,22 @@ def tag_observations(bag: str, setup, start, end) -> Dict[float, Tuple[str, np.n
 _VARIANT_COLORS = {"fixed_lag_30s": "tab:blue", "fixed_lag_60s": "tab:orange"}
 
 
-def _seeded(r) -> np.ndarray:
-    """Per-keyframe "X_k seeded from tag" flags (``reloc`` in runs saved before the lean gate)."""
-    return np.asarray(r["seeded"] if "seeded" in r else r["reloc"]).astype(bool)
+def _init_jump(r) -> np.ndarray:
+    """Per-keyframe "X_k initial value jumped" flags (``replay_bag.INIT_JUMP_M``).
+
+    Runs saved before ``init_shift`` carry ``seeded`` (``reloc`` before the lean gate).
+    """
+    for key in ("init_jump", "seeded", "reloc"):
+        if key in r:
+            return np.asarray(r[key]).astype(bool)
+    raise KeyError("init_jump")
 
 
 def plot(results: List[dict], ref: dict, series: Dict[str, dict], setup, out: str,
          t_bag0: float, obs: Dict[float, Tuple[str, np.ndarray]], title: str) -> str:
     """One figure in the style of plot_bev: full + zoomed BEV, then time series.
 
-    Markers (tag frames, tag-seeded keyframes, init, DVL dropouts) come from the
+    Markers (tag frames, initial-value jumps, init, DVL dropouts) come from the
     reference run, whose full graph defines the batch LM solution.
     """
     import matplotlib
@@ -280,14 +282,14 @@ def plot(results: List[dict], ref: dict, series: Dict[str, dict], setup, out: st
 
     from ..core.common.geometry import pose_from_matrix
 
-    t = ref["stamp"] - t_bag0                         # seconds into the bag
+    t = ref["stamp"] - t_bag0                         # seconds into the recording
     colors = {r["name"]: _VARIANT_COLORS.get(r["name"], _COLORS[i % len(_COLORS)])
               for i, r in enumerate(results)}
     E, X_ref, X_lm = ref["E"], ref["X"], ref["X_lm"]
     trk = ref["has_S"]
     acc = ref["n_acc"] > 0
     rej = (ref["n_rej"] > 0) & ~acc
-    reloc = _seeded(ref)
+    reloc = _init_jump(ref)
     dvl = ref["dvl_sigma"] > 0 if "dvl_sigma" in ref else np.zeros(len(t), bool)
     i_init = np.where(ref["init"])[0]
     S_lm = pose_from_matrix(ref["S_lm"]) if np.all(np.isfinite(ref["S_lm"])) else None
@@ -338,7 +340,7 @@ def plot(results: List[dict], ref: dict, series: Dict[str, dict], setup, out: st
         if reloc.any():
             ax.scatter(X_ref[reloc, 0, 3], X_ref[reloc, 1, 3], s=45 if detail else 22, marker="D",
                        facecolors="none", edgecolors="magenta", lw=1.2, zorder=6,
-                       label=f"X_k seeded from tag ({reloc.sum()})")
+                       label=f"X_k initial value jumped ({reloc.sum()})")
         if dvl.any():
             ax.scatter(E[dvl, 0, 3], E[dvl, 1, 3], s=6, color="red", zorder=7,
                        label=f"odometry de-weighted, DVL dropout ({dvl.sum()} keyframes)")
@@ -436,9 +438,9 @@ def plot(results: List[dict], ref: dict, series: Dict[str, dict], setup, out: st
     if dvl.any():
         axs[3].vlines(t[dvl], 0.15, 0.35, color="red", lw=0.5)
     axs[3].set_yticks([0.25, 0.78])
-    axs[3].set_yticklabels(["tag seed / DVL dropout", "tag frames"], fontsize=8)
+    axs[3].set_yticklabels(["init jump / DVL dropout", "tag frames"], fontsize=8)
     axs[3].set_ylim(0, 1.05)
-    axs[3].set_xlabel("time [s into the bag]")
+    axs[3].set_xlabel("time [s into the recording]")
     for k, a in enumerate(axs):
         for j, (b0, b1) in enumerate(blind):
             a.axvspan(b0, b1, color="0.88", lw=0, zorder=0,
@@ -459,7 +461,7 @@ def plot(results: List[dict], ref: dict, series: Dict[str, dict], setup, out: st
 def main(argv: List[str] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("bag", help="bag with EKF odometry and corner-detection topics")
-    ap.add_argument("--config", required=True, nargs="+", help="dock_fuser parameter file(s), merged in order")
+    ap.add_argument("--config", required=True, nargs="+", help="node parameter file(s), merged in order")
     ap.add_argument("--out", required=True, help="report directory")
     ap.add_argument("--variants", nargs="+", default=["fixed_lag:30", "fixed_lag:60"],
                     help="one or more fixed_lag:<seconds>")
@@ -467,8 +469,8 @@ def main(argv: List[str] = None) -> None:
                     help="variant whose full graph is solved with batch LM (the reference)")
     ap.add_argument("--max-wall", nargs="*", default=[],
                     help="per-variant wall-time budget, e.g. fixed_lag:60=900 (seconds); not for the reference")
-    ap.add_argument("--start", type=float, default=None, help="window start, s from bag start")
-    ap.add_argument("--end", type=float, default=None, help="window end, s from bag start")
+    ap.add_argument("--start", type=float, default=None, help="window start, s into the recording")
+    ap.add_argument("--end", type=float, default=None, help="window end, s into the recording")
     ap.add_argument("--replot", action="store_true",
                     help="redraw the figure and summary from the saved results in --out (no replay)")
     args = ap.parse_args(argv)
@@ -518,11 +520,11 @@ def main(argv: List[str] = None) -> None:
     rows, series = analyse(results, ref)
     from ..ros.params import build_setup, getter_from_yaml
     setup = build_setup(getter_from_yaml(args.config), lambda m: None)
-    from .replay_bag import bag_source, bag_start_time, load_camera_info
+    from .bag import bag_source, load_camera_info, source_start_time
     load_camera_info(args.bag, setup)
     obs = tag_observations(args.bag, setup, args.start, args.end)
     win = f"{args.start or 0:g}-{args.end if args.end is not None else 'end'} s"
-    fig_path = plot(results, ref, series, setup, args.out, bag_start_time(args.bag), obs,
+    fig_path = plot(results, ref, series, setup, args.out, source_start_time(args.bag), obs,
                     f"{bag_source(args.bag)}, window {win}: "
                     f"real-time backends vs batch LM")
 

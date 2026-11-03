@@ -1,9 +1,9 @@
-# Jetson setup: tag detector + dock_fuser
+# Jetson setup: tag detector + race_auv_factorgraph
 
 How to set up a Jetson (the vehicle's back-seat computer) to run the factor-graph docking pipeline:
 - the two camera drivers;
 - the `race_auv_camera_tag_factorgraph` tag detectors;
-- `dock_fuser`.
+- `race_auv_factorgraph` (the factor graph).
 
 Most dependencies come from rosdep. A few do not, and those are the steps that are easy to miss. Pipeline design: [DOCK_FUSER_PIPELINE.md](DOCK_FUSER_PIPELINE.md).
 
@@ -11,7 +11,7 @@ Tested on a Jetson Orin Nano Super (JetPack R39, Ubuntu 24.04, ROS 2 Jazzy, Pyth
 
 ## 1. Clone
 
-`race_station` is a separate repository, not a submodule. `dock_fuser` needs its station URDF (tag poses, `dock_point`).
+`race_station` is a separate repository, not a submodule. `race_auv_factorgraph` needs its station URDF (tag poses, `dock_point`).
 
 ```bash
 cd ~/ros2_ws/src
@@ -28,7 +28,7 @@ cd .. && git clone -b jazzy-devel-docking-sim https://github.com/GSO-soslab/race
 It leaves out the nested `race_auv_perception/third_party/isaac_ros_nitros` on purpose.
 
 **`isaac_ros_nitros` is optional.** It is only needed by `race_auv_apriltag_cuda`, the CUDA detector of the older `race_auv_camera_pkg` pipeline (`bringup_camera_perception.launch.py`).
-- **Not needed here:** the factor-graph detector (`race_auv_camera_tag_factorgraph`, CPU apriltag3) and `dock_fuser` do not use it.
+- **Not needed here:** the factor-graph detector (`race_auv_camera_tag_factorgraph`, CPU apriltag3) and `race_auv_factorgraph` do not use it.
 - **Builds without it:** `race_auv_apriltag_cuda` still builds. CMake warns "cuAprilTags library not found … Skipping the CUDA detector shim", and that package falls back to its CPU backend.
 - **Needs git-lfs:** do not clone with `--recurse-submodules` without git-lfs. That checkout stops with an error on this submodule.
 
@@ -83,7 +83,7 @@ python3 -m pytest -q src/race_auv/race_auv_factorgraph/test \
     src/race_auv/race_auv_perception/race_auv_camera_tag_factorgraph/test
 ```
 
-All 45 tests should pass: 35 `race_auv_factorgraph`, 10 `race_auv_camera_tag_factorgraph`. The detector tests also run on the Jetson's OpenCV 4.6. On that version the rectified camera matrix differs from the desktop's by about 0.04 px. This is harmless: `dock_fuser` takes the matrix from the detector's own `camera_info`.
+All 69 tests should pass: 45 `race_auv_factorgraph`, 24 `race_auv_camera_tag_factorgraph`. The detector tests also run on the Jetson's OpenCV 4.6. On that version the rectified camera matrix differs from the desktop's by about 0.04 px. This is harmless: `race_auv_factorgraph` takes the matrix from the detector's own `camera_info`.
 
 ## 5. System setup
 
@@ -95,7 +95,7 @@ All 45 tests should pass: 35 `race_auv_factorgraph`, 10 `race_auv_camera_tag_fac
   ros2 topic echo /race_auv/odometry/filtered --once
   ```
 
-**Clock sync (chrony) with the front-seat computer.** `dock_fuser` pairs each detection with the EKF pose by **header stamp**. The EKF runs on the front-seat Pi, the detector on the Jetson, so the two clocks must agree. An offset shows up as `ekf_age_s` in `/diagnostics`.
+**Clock sync (chrony) with the front-seat computer.** `race_auv_factorgraph` pairs each detection with the EKF pose by **header stamp**. The EKF runs on the front-seat Pi, the detector on the Jetson, so the two clocks must agree. An offset shows up as `ekf_age_s` in `/diagnostics`.
 
 **Camera USB paths.** `race_auv_bringup/launch/include/multi_camera.launch.py` selects the two cameras by `video.product_name`:
 - `usb-3610000.usb-2.3`: stellar2, `cam_front`;
@@ -113,8 +113,8 @@ ros2 launch race_auv_bringup bringup_camera_tag_factorgraph.launch.py
 
 This starts, in order:
 1. the cameras;
-2. the detectors, after 3 s;
-3. `dock_fuser`, after 8 s.
+2. the detectors, after 5 s;
+3. `race_auv_factorgraph`, after 12 s.
 
 The vehicle configs are in `race_auv_bringup/config/`:
 
@@ -122,28 +122,17 @@ The vehicle configs are in `race_auv_bringup/config/`:
 |---|---|
 | `station_tags.yaml` | tag IDs and sizes, shared by the detectors and the fuser |
 | `tag_factorgraph_detector.yaml` | raw camera calibration, detector settings |
-| `dock_fuser.yaml` | factor-graph settings |
+| `race_auv_factorgraph.yaml` | factor-graph settings |
 
 **Checks once running:**
 - `ros2 topic hz /cam_front/apriltag_detection/tags`: 5 Hz, one message per processed image, with or without tags.
-- `/diagnostics` (`dock_fuser`): `frames_dropped` and `frames_waiting` stay 0. The state goes `NO_STATION` → `CANDIDATE` → `TRACKING` once the station tags have been seen.
+- `/diagnostics` (`race_auv_factorgraph`): `frames_dropped` and `frames_waiting` stay 0. The state goes `NO_STATION` → `CANDIDATE` → `TRACKING` once the station tags have been seen.
 
 ## 7. Topside viewing
 
-On the topside computer (same ROS network):
+Foxglove on the topside (through `foxglove_bridge` on the vehicle, or a recorded bag): a 3D panel in display frame `race_auv/odom_graph` with the graph's and the EKF's tracks, the AUV and station frames and the dock covariance, plus Image panels for the camera feeds and the `cam_front` detector image. The panel settings are in [ROS_INTERFACE.md §7](ROS_INTERFACE.md#7-foxglove).
 
-```bash
-sudo apt install ros-jazzy-compressed-image-transport   # RViz decodes the compressed camera topics
-ros2 launch race_auv_bringup bringup_rviz_factorgraph.launch.py
-```
-
-The RViz window shows:
-- the graph's and the EKF's live tracks;
-- the AUV and station frames;
-- the two camera feeds (`cam_down` turned 180° on the topside);
-- the `cam_front` detector image.
-
-This needs `publish_debug: true` in `dock_fuser.yaml` and the `cam_front` detector's `publish_image: true`; both are set in the vehicle configs. See §10 of the [pipeline doc](DOCK_FUSER_PIPELINE.md).
+This needs `publish_debug: true` in `race_auv_factorgraph.yaml` and the `cam_front` detector's `publish_image: true`; both are set in the vehicle configs.
 
 ## 8. Expected real-time margin
 
@@ -159,4 +148,4 @@ Measured on the Orin Nano Super (25 W, clocks not locked): one detector plus `do
 - CPU load was 26 % on average (6 cores), 6.1 W, 1.1 GB RAM.
 - The full vehicle load (two camera drivers, two detectors) has not been measured yet.
 
-The figure `dock_fuser_graph_overview_timing.png` shows this run.
+The figure `graphs/2026_09_16-16_16_47/overview_timing.png` shows this run.

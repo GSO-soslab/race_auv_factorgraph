@@ -22,7 +22,7 @@ from race_auv_factorgraph.tools.synthetic import (ScenarioConfig, dock_error,
 
 def fly(scenario_cfg: ScenarioConfig, **est_kwargs):
     scn = make_scenario(scenario_cfg)
-    est = DockEstimator(EstimatorConfig(**est_kwargs), scn.cameras, scn.tags, scn.T_dock_base)
+    est = DockEstimator(EstimatorConfig(**est_kwargs), scn.cameras, scn.tags)
     return scn, est, run(scn, est)
 
 
@@ -97,7 +97,7 @@ def test_mounting_error_tolerated():
 def test_recovers_from_backend_failure(monkeypatch):
     """An optimizer exception mid-run rebuilds the backend and keeps tracking (§9)."""
     scn = make_scenario(ScenarioConfig())
-    est = DockEstimator(EstimatorConfig(), scn.cameras, scn.tags, scn.T_dock_base)
+    est = DockEstimator(EstimatorConfig(), scn.cameras, scn.tags)
 
     from race_auv_factorgraph.core.backend import smoother as backend_mod
     original = backend_mod.Backend.update
@@ -136,8 +136,11 @@ def test_reacquired_after_long_blackout_with_large_drift():
     """Tags lost for 8 s while the EKF drifts 0.24 m (~75 px at 2.5 m), as
     in the close-range part of the tank test. Nothing compares the tag with
     the drifted estimate, so it is used again on the first frame it is seen,
-    and the keyframe starts at the tag-implied pose instead of the drifted
-    odometry prediction."""
+    and that keyframe's initial value moves from the drifted odometry
+    prediction toward the tags (_init_from_tags). Not all the way (0.11 m):
+    the odometry model expects ~6 cm of drift over the gap, and the station's
+    odom-frame prior takes part of the residual too; the smoother finishes
+    the correction on the next keyframes (final error below)."""
     # Yaw drift is left out: the synthetic drift rotates about the odom
     # origin, which turns yaw drift into a position error growing with the
     # distance from the origin, much faster than a real EKF.
@@ -147,9 +150,10 @@ def test_reacquired_after_long_blackout_with_large_drift():
     first = next(r for r in after if r.accepted)
     # Used again on the first frame after the blackout (5 Hz).
     assert first.stamp < 18.3
-    assert first.seeded_from_tag
-    # Seeding happens only after the drift, not in steady tracking.
-    assert sum(r.seeded_from_tag for r in res) <= 3
+    assert first.init_shift > 0.08
+    # Only after the drift: in steady tracking the initial value stays within
+    # a few cm of the odometry prediction.
+    assert sum(r.init_shift > 0.05 for r in res) <= 3
     assert sum(len(r.rejected) for r in res) <= 5
     dt, dr = final_error(scn, res)
     assert dt < 0.02 and dr < math.radians(1.0)
@@ -192,7 +196,7 @@ def test_dvl_dropout_deweights_odometry():
     assert sum(r.dvl_extra_sigma > 0 for r in res) > 20          # the dropout's steps
     scn_off = make_scenario(sc)
     scn_off.dvl = []                                              # control: no DVL topic
-    est_off = DockEstimator(EstimatorConfig(), scn_off.cameras, scn_off.tags, scn_off.T_dock_base)
+    est_off = DockEstimator(EstimatorConfig(), scn_off.cameras, scn_off.tags)
     res_off = run(scn_off, est_off)
     assert p95_from(res, 8.0) < p95_from(res_off, 8.0)
     dt, dr = final_error(scn, res)

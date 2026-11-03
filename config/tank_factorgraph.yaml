@@ -1,6 +1,7 @@
-# dock_fuser parameters for the tank-test bag replay (launch/bag_test.launch.py).
-# Front camera only, tag 146 only, fixed-lag smoother, debug topics on for tools/plot_bev.py.
-dock_fuser:
+# race_auv_factorgraph parameters for the tank-test bag replay (launch/bag_test.launch.py)
+# and the offline tools. Front camera only, tag 146 only, fixed-lag smoother,
+# analysis topics on for tools/plot_bev.py.
+/**/race_auv_factorgraph:
   ros__parameters:
     odom_topic: /race_auv/odometry/filtered     # recorded EKF output
     # DVL bottom-lock velocity, published only while the DVL has bottom lock.
@@ -8,12 +9,12 @@ dock_fuser:
     # returns; those odometry steps are de-weighted (estimator.dvl_*).
     # "" disables it.
     dvl_topic: /race_auv/nucleus_node/bottom_lock_velocity_common
-    graph_frame: race_auv/odom
+    odom_frame: race_auv/odom
+    odom_graph_frame: race_auv/odom_graph
     base_frame: race_auv/base_link
     station_base_frame: race_station/base_link
     dock_frame: race_station/dock_point
-    publish_station_static_tf: true
-    dock_pose_topic: /race_auv/dock_point/pose
+    publish_station_frames: true
     publish_debug: true
     path_rate: 1.0                 # ~/path, ~/ekf_path: re-published at this rate (Hz)
     path_length: 3000              # keyframes kept in each path (10 min at 5 Hz)

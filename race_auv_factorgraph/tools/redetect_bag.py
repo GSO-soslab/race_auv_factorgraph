@@ -30,9 +30,10 @@ Output bag
 ----------
 * ``/<cam>/apriltag_detection/tags`` (re-detected) and ``.../camera_info``
   (the rectifier's intrinsics), for every camera in ``--cameras``;
-* copied unchanged: the EKF, the DVL and the live dock_fuser topics
-  (``/dock_fuser/auv_pose``, ``station_pose``, ``keyframe``), so
-  ``analyze_run`` can still compare against the live estimates;
+* copied unchanged: the EKF, the DVL and the live node's analysis topics
+  (``~/auv_pose``, ``~/dock_pose``, ``~/keyframe``, or the former
+  ``/dock_fuser/...`` ones), so ``analyze_run`` can still compare against
+  the live estimates;
 * ``source.yaml`` naming the input bag, so the time axis of every tool stays
   seconds into the original recording.
 
@@ -72,16 +73,14 @@ if __package__ in (None, ""):
     __package__ = "race_auv_factorgraph.tools"
 
 from ..ros.params import flatten_params_yaml
-from .replay_bag import _open_reader
+from ..ros.msgs import sec_to_stamp, stamp_to_sec
+from .bag import LIVE_TOPICS, open_reader
 
 # Copied unchanged into the output bag (when present in the input).
 COPY_TOPICS = [
     "/race_auv/odometry/filtered",
     "/race_auv/nucleus_node/bottom_lock_velocity_common",
-    "/dock_fuser/auv_pose",
-    "/dock_fuser/station_pose",
-    "/dock_fuser/keyframe",
-    "/race_auv/dock_point/pose",
+    *(t for names in LIVE_TOPICS.values() for t in names),
 ]
 
 # The detector node's parameter defaults that matter here (detector_node.py).
@@ -197,7 +196,7 @@ def redetect(bag: str, out: str, config: Sequence[str], cameras: Sequence[str],
     tags_topic = {cam: f"/{cam}/apriltag_detection/tags" for cam in cameras}
     image_cam = {d.image_topic: cam for cam, d in dets.items()}
 
-    reader = _open_reader(bag)
+    reader = open_reader(bag)
     types = {t.name: t.type for t in reader.get_all_topics_and_types()}
     # A synced camera's images follow its reference's messages, not its own record.
     sync_refs = {d.sync_to: cam for cam, d in dets.items() if d.sync_to}
@@ -243,7 +242,6 @@ def redetect(bag: str, out: str, config: Sequence[str], cameras: Sequence[str],
 
     def emit_synced(cam: str, ready, t_recv: int) -> None:
         """Detect and write a synced camera's matched images (stamped with their own image time)."""
-        from builtin_interfaces.msg import Time
         for t_ref, t_img, jpeg in ready:
             res = dets[cam].detect(jpeg)
             if res is None:
@@ -253,16 +251,15 @@ def redetect(bag: str, out: str, config: Sequence[str], cameras: Sequence[str],
             sync_dt[cam].append(t_img - t_ref)
             for t in res.tags:
                 counts[cam][t.tag_id] += 1
-            sec = int(np.floor(t_img))
-            stamp = Time(sec=sec, nanosec=int(round((t_img - sec) * 1e9)) % 1_000_000_000)
-            writer.write(tags_topic[cam], serialize_message(dets[cam].tags_msg(res, stamp)), t_recv)
+            writer.write(tags_topic[cam], serialize_message(dets[cam].tags_msg(res, sec_to_stamp(t_img))),
+                         t_recv)
 
     while reader.has_next():
         topic, data, t_recv = reader.read_next()
         if topic in sync_refs:            # a reference detection: ask the synced camera
             ref = deserialize_message(data, AprilTagDetectionArray)
             cam = sync_refs[topic]
-            dets[cam].sync.add_reference(ref.header.stamp.sec + 1e-9 * ref.header.stamp.nanosec)
+            dets[cam].sync.add_reference(stamp_to_sec(ref.header.stamp))
             emit_synced(cam, dets[cam].sync.pop_ready(), t_recv)
             if topic not in tags_cam:     # the reference camera itself is not re-detected
                 continue
@@ -270,8 +267,7 @@ def redetect(bag: str, out: str, config: Sequence[str], cameras: Sequence[str],
             cam = image_cam[topic]
             msg = deserialize_message(data, CompressedImage)
             if dets[cam].sync_to:
-                dets[cam].sync.add_image(msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec,
-                                         bytes(msg.data))
+                dets[cam].sync.add_image(stamp_to_sec(msg.header.stamp), bytes(msg.data))
                 emit_synced(cam, dets[cam].sync.pop_ready(), t_recv)
                 continue
             buf = images[cam]

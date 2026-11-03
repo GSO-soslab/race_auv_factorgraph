@@ -3,7 +3,7 @@
 Usage::
 
     ros2 run race_auv_factorgraph replay_bag BAG_DIR \\
-        --config $(ros2 pkg prefix race_auv_factorgraph)/share/race_auv_factorgraph/config/dock_fuser_sim.yaml \\
+        --config $(ros2 pkg prefix race_auv_factorgraph)/share/race_auv_factorgraph/config/factorgraph_sim.yaml \\
         --out /tmp/run1 [--holdout-every 5] [--exclude-tag 36h11:146] \\
         [--gt-topic /race_auv/docking_station/ground_truth/pose] [--frame-stride 3]
 
@@ -39,18 +39,14 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import gtsam
-import numpy as np
 
 from ..core.common.config import EstimatorConfig
 from ..core.backend.estimator import DockEstimator, KeyframeResult
-from ..core.common.geometry import pose_from_quat_xyzw
 from ..core.common.model import Detection, TagFrame, normalize_family, tag_key_str
 from ..core.frontend.scheduler import KeyframeScheduler
+from ..ros.msgs import pose_from_msg, stamp_to_sec, tag_detections
 from ..ros.params import build_setup, getter_from_yaml
-
-
-def _stamp(msg) -> float:
-    return float(msg.header.stamp.sec) + 1e-9 * float(msg.header.stamp.nanosec)
+from .bag import load_camera_info, open_reader, source_start_time
 
 
 def _pose_cols(prefix: str, T: gtsam.Pose3) -> Dict[str, float]:
@@ -61,88 +57,6 @@ def _pose_cols(prefix: str, T: gtsam.Pose3) -> Dict[str, float]:
     return {f"{prefix}_x": t[0], f"{prefix}_y": t[1], f"{prefix}_z": t[2],
             f"{prefix}_roll": math.degrees(R.roll()), f"{prefix}_pitch": math.degrees(R.pitch()),
             f"{prefix}_yaw": math.degrees(R.yaw())}
-
-
-def bag_source(bag: str) -> str:
-    """Display name of the recording a bag came from, for plot titles.
-
-    ``bag_test.launch.py`` writes ``source.yaml`` into its output bag (the
-    original recording and the replayed window). Without it the bag's own
-    directory name is used.
-    """
-    name = os.path.basename(os.path.normpath(bag))
-    path = os.path.join(bag, "source.yaml")
-    if not os.path.exists(path):
-        return name
-    import yaml
-    with open(path, encoding="utf-8") as f:
-        src = yaml.safe_load(f) or {}
-    out = str(src.get("source_bag", name))
-    if float(src.get("start_offset", 0.0)):
-        out += f" (from {float(src['start_offset']):g} s)"
-    return out
-
-
-def source_start_time(bag: str) -> float:
-    """Start (s) of the original recording a bag came from, the zero of the plot time axes.
-
-    From ``source.yaml`` (``bag_test.launch.py``): the start of the recording
-    at ``source_path`` if it is still there, else this bag's start minus the
-    replayed ``start_offset``. Without ``source.yaml``: this bag's own start.
-    Times on that axis then read as seconds into the original recording,
-    whichever window of it the bag holds.
-    """
-    path = os.path.join(bag, "source.yaml")
-    if not os.path.exists(path):
-        return bag_start_time(bag)
-    import yaml
-    with open(path, encoding="utf-8") as f:
-        src = yaml.safe_load(f) or {}
-    original = src.get("source_path", "")
-    if original and os.path.isdir(original):
-        return bag_start_time(original)
-    return bag_start_time(bag) - float(src.get("start_offset", 0.0))
-
-
-def bag_start_time(bag: str) -> float:
-    """Recording start of the bag (seconds), from its metadata."""
-    return _open_reader(bag).get_metadata().starting_time.nanoseconds * 1e-9
-
-
-def _open_reader(bag: str):
-    import rosbag2_py
-    reader = rosbag2_py.SequentialReader()
-    storage_id = "mcap" if any(f.endswith(".mcap") for f in os.listdir(bag)) else "sqlite3"
-    reader.open(rosbag2_py.StorageOptions(uri=bag, storage_id=storage_id),
-                rosbag2_py.ConverterOptions("cdr", "cdr"))
-    return reader
-
-
-def load_camera_info(bag: str, setup) -> None:
-    """Complete the cameras without config intrinsics from the bag's recorded camera_info.
-
-    Same source as the live node: the tag detector's latched, rectified
-    camera_info (``bag_test.launch.py`` records it). Older detection bags
-    have none; their config must then set ``cameras.<name>.fx ...``.
-    """
-    from rclpy.serialization import deserialize_message
-    from sensor_msgs.msg import CameraInfo
-    import rosbag2_py
-
-    missing = {setup.camera_info_topics[n]: n for n in setup.missing_intrinsics()}
-    if not missing:
-        return
-    reader = _open_reader(bag)
-    reader.set_filter(rosbag2_py.StorageFilter(topics=list(missing)))
-    while missing and reader.has_next():
-        topic, data, _ = reader.read_next()
-        if topic in missing:
-            msg = deserialize_message(data, CameraInfo)
-            setup.add_camera_info(missing.pop(topic), msg.k, msg.width, msg.height)
-    if missing:
-        raise RuntimeError(
-            f"no intrinsics for camera(s) {sorted(missing.values())}: the config sets no "
-            f"cameras.<name>.fx/fy/cx/cy/width/height and the bag has no {sorted(missing)}")
 
 
 def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorConfig] = None,
@@ -169,9 +83,12 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
     on_gt(stamp, pose_msg)
         Called for every message on ``gt_topic``.
     start, end
-        Optional window in seconds from the start of the bag (by receive
-        time). Messages outside it are skipped, so the estimator starts
-        fresh at ``start``, exactly as if the bag began there.
+        Optional window in seconds into the original recording
+        (:func:`~race_auv_factorgraph.tools.bag.source_start_time`; for a
+        bag that is a whole recording, seconds from its start), by receive
+        time. Every tool uses this time axis. Messages outside the window
+        are skipped, so the estimator starts fresh at ``start``, exactly as
+        if the bag began there.
     frame_stride
         Keep only every Nth detector message (1 = all). Emulates a slower
         detector on a bag recorded at a higher rate: the tank bags have the
@@ -191,13 +108,13 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
     from rosidl_runtime_py.utilities import get_message
 
     load_camera_info(bag, setup)
-    est = DockEstimator(cfg or setup.cfg, setup.cameras, setup.tags, setup.T_dock_base)
+    est = DockEstimator(cfg or setup.cfg, setup.cameras, setup.tags)
     sched = KeyframeScheduler(ekf_buffer_seconds=float(get("ekf_buffer_seconds")),
                               attached_cameras=setup.attached_cameras)
     odom_topic = get("odom_topic")
     cam_by_topic = {topic: cam for cam, topic in setup.camera_topics.items()}
-    reader = _open_reader(bag)
-    t_bag0 = reader.get_metadata().starting_time.nanoseconds * 1e-9
+    reader = open_reader(bag)
+    t0 = source_start_time(bag)                       # zero of start / end
     types = {t.name: t.type for t in reader.get_all_topics_and_types()}
     for needed in [odom_topic, *cam_by_topic]:
         if needed not in types:
@@ -218,26 +135,24 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
         topic, data, t_recv_ns = reader.read_next()
         if topic not in msg_cls:
             continue
-        t_rel = t_recv_ns * 1e-9 - t_bag0
+        t_rel = t_recv_ns * 1e-9 - t0
         if start is not None and t_rel < start:
             continue
         if end is not None and t_rel > end:
             break
         msg = deserialize_message(data, msg_cls[topic])
+        t = stamp_to_sec(msg.header.stamp)
         if topic == odom_topic:
-            p, q = msg.pose.pose.position, msg.pose.pose.orientation
-            sched.add_odometry(_stamp(msg), pose_from_quat_xyzw((p.x, p.y, p.z),
-                                                                 (q.x, q.y, q.z, q.w)))
+            sched.add_odometry(t, pose_from_msg(msg))
         elif topic == gt_topic:
             if on_gt is not None:
-                on_gt(_stamp(msg), msg)
+                on_gt(t, msg)
             continue
         elif topic == dvl_topic:
-            est.dvl.add(_stamp(msg))
+            est.dvl.add(t)
             continue
         else:
             cam = cam_by_topic[topic]
-            t = _stamp(msg)
             if frame_stride > 1:
                 last = last_image_stamp.get(cam)
                 if last is not None and t <= last:
@@ -249,12 +164,8 @@ def replay(bag: str, get: Callable[[str], Any], setup, cfg: Optional[EstimatorCo
             dets, held = [], []
             frame_count += 1
             hold_frame = holdout_every > 0 and frame_count % holdout_every == 0
-            for d in msg.detections:
-                key = (normalize_family(d.family), int(d.id))
-                if key not in setup.tags:
-                    continue
-                det = Detection(cam, key, np.array([[c.x, c.y] for c in d.corners], dtype=float))
-                (held if hold_frame or key in excluded else dets).append(det)
+            for det in tag_detections(cam, msg, setup.tags)[0]:
+                (held if hold_frame or det.tag in excluded else dets).append(det)
             if held:
                 holdout_dets[t] = held
             # Every detector message becomes a keyframe, also an empty one or
@@ -274,16 +185,16 @@ def main(argv: List[str] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("bag", help="rosbag2 directory")
     ap.add_argument("--config", required=True, nargs="+",
-                    help="dock_fuser parameter file(s), merged in order (e.g. station_tags.yaml "
-                         "dock_fuser.yaml)")
+                    help="node parameter file(s), merged in order (e.g. station_tags.yaml "
+                         "race_auv_factorgraph.yaml)")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--holdout-every", type=int, default=0,
                     help="withhold every Nth tag frame from the graph and report its residual")
     ap.add_argument("--exclude-tag", action="append", default=[],
                     help="leave-one-tag-out: never give this tag (family:id) to the graph")
     ap.add_argument("--gt-topic", default="", help="ground-truth PoseStamped topic to export")
-    ap.add_argument("--start", type=float, default=None, help="window start, s from bag start")
-    ap.add_argument("--end", type=float, default=None, help="window end, s from bag start")
+    ap.add_argument("--start", type=float, default=None, help="window start, s into the recording")
+    ap.add_argument("--end", type=float, default=None, help="window end, s into the recording")
     ap.add_argument("--frame-stride", type=int, default=1,
                     help="keep every Nth detector image, e.g. 3 to replay a 15 Hz bag at 5 Hz")
     args = ap.parse_args(argv)
@@ -302,7 +213,7 @@ def main(argv: List[str] = None) -> None:
         row = {"stamp": res.stamp, "state": res.state.value, "n_accepted": len(res.accepted),
                "n_rejected": len(res.rejected), "initialized_now": int(res.initialized_now),
                "recovered": int(res.recovered),
-               "seeded_from_tag": int(res.seeded_from_tag),
+               "init_shift_m": round(res.init_shift, 4),
                "update_ms": res.update_time * 1000.0, "init_note": res.init_note}
         dock = res.dock_in_base
         row.update(_pose_cols("dock", dock))

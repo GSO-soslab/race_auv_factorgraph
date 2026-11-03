@@ -3,11 +3,11 @@
 Usage::
 
     # the graph over one short window
-    ros2 run race_auv_factorgraph plot_graph DETECTION_BAG --config tank_dock_fuser.yaml \\
+    ros2 run race_auv_factorgraph plot_graph DETECTION_BAG --config tank_factorgraph.yaml \\
         --start 30 --window 90.5 95.5 --label A --frame-stride 3 --out graph_init.png
 
     # overview: the whole run, with a labelled box around each window
-    ros2 run race_auv_factorgraph plot_graph DETECTION_BAG --config tank_dock_fuser.yaml \\
+    ros2 run race_auv_factorgraph plot_graph DETECTION_BAG --config tank_factorgraph.yaml \\
         --start 30 --overview 420 --window 90.5 95.5 --window 228.5 232.5 --out overview.png
 
 All times are seconds into the **original recording**: ``bag_test.launch.py``
@@ -59,28 +59,44 @@ labelled box (A, B, ...) around the poses of each ``--window``. Every tag
 observation is also drawn where it puts the tag in odom, once through the EKF
 (``E_k T_bc T_ct``, green like the EKF track) and once through the graph
 (``X_k T_bc T_ct``, blue like the graph track), with ``T_ct`` the single-image PnP pose: the tag does not move, so the
-EKF cloud smears out with the drift while the graph's stays tight. Bottom: the
+EKF cloud smears out with the drift while the graph's stays tight. At the end
+of each track a triangle marks where its last keyframe leaves each camera
+(``end pose * T_bc``), offset from the base_link cross by the lever arm. Bottom: the
 drift correction ``||t(X_k) - t(E_k)||`` (3D distance between the graph's and
 the EKF's AUV position) over time, a raster of
 keyframes with tag factors, the time before TRACKING, and the same windows
-shaded with their labels.
+shaded with their labels. The graph track carries a time mark: a tick
+perpendicular to the track with the recording time written beside it, every
+30 s (``--time-every``), so a track that crosses the same place twice can be read chronologically.
+
+``--batch`` adds the batch post-processing solution (``tools/batch_lm.py``):
+after the replay, the *same* graph is re-solved once with Levenberg-Marquardt
+from the real-time estimates, so every ``X_k`` also profits from the tag
+observations made after it (full smoothing, no fixed-lag marginalization).
+Drawn as a purple dash-dot track and a second drift-correction curve, plus a
+tag cloud chained through the smoothed poses; the summary (graph error, real-
+time vs LM shift, S shift) is printed.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
-import os
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import gtsam
 import numpy as np
 
 from ..core.common import keys as K
+from ..core.common.geometry import pose_distance
+from ..core.common.model import tag_key_str
 from ..core.init.state_machine import StationState
 from ..ros.params import build_setup, getter_from_yaml
-from .replay_bag import bag_source, bag_start_time, replay, source_start_time
+from .bag import INIT_JUMP_M, bag_source, bag_start_time, live_topic, open_reader, source_start_time
+from .plotting import cloud_spread, cpu_name, direction_marks, time_labels, timing_stats, window_box
+from .replay_bag import replay
 
 # Colours shared by both panels.
 C_X_TAG = "#2b6cb0"      # keyframe with tag factors
@@ -93,6 +109,8 @@ C_ANCHOR = "#1a202c"
 C_EKF = "#38a169"         # EKF E_k: green, distinct from the graph track (blue)
 C_HL = "#d69e2e"         # overview: highlighted window segment
 C_KF_TAG = "#e53e3e"     # overview: keyframe with tag factors, dots on the graph track (red)
+C_LM = "#6b46c1"         # overview --batch: batch LM track (purple, dash-dot)
+FAINT = 0.15             # overview --focus-from: alpha of everything before the focus
 
 
 @dataclass
@@ -127,7 +145,6 @@ class Window:
     T: Dict[int, gtsam.Pose3]      # T_j key -> estimate (pose of tag j in dock_point)
     t_names: Dict[int, str]        # T_j key -> "36h11:146"
     stub_from: Optional[int] = None  # X key before the window linked by odometry (left stub)
-    meta: dict = field(default_factory=dict)
 
 
 def _chr(key: int) -> str:
@@ -153,7 +170,6 @@ def collect(bag: str, config, start: float, w0: float, w1: float,
     # Times are seconds into the original recording (source.yaml), so the
     # windows mean the same whichever slice of it the bag holds.
     t_bag0 = source_start_time(bag)
-    shift = bag_start_time(bag) - t_bag0          # bag start, in recording time
     kfs: List[KeyframeInfo] = []
     size = [0]
 
@@ -166,7 +182,7 @@ def collect(bag: str, config, start: float, w0: float, w1: float,
         size[0] = n
 
     est, _ = replay(bag, get, setup, cfg=cfg, on_keyframe=on_kf,
-                    start=None if start is None else max(0.0, start - shift), end=w1 - shift,
+                    start=start, end=w1,
                     frame_stride=frame_stride)
     if est.n_recoveries:
         print(f"warning: {est.n_recoveries} backend recoveries; only the last backend's "
@@ -220,12 +236,11 @@ def collect(bag: str, config, start: float, w0: float, w1: float,
 
     # Only the URDF priors of tags actually observed in the window.
     factors = [f for f in factors if f.kind != "urdf" or f.keys[0] in t_keys]
-    names = {est.tag_index.key(tag): f"{tag[0]}:{tag[1]}" for tag in est.tag_index.tags()}
+    names = {est.tag_index.key(tag): tag_key_str(tag) for tag in est.tag_index.tags()}
     T = {k: est.backend.pose(k) for k in t_keys if est.backend.pose(k) is not None}
     return Window(kfs=in_win, factors=factors, S=est.backend.pose(K.S), T=T,
                   t_names={k: names.get(k, K.describe(k)) for k in t_keys},
-                  stub_from=stub_from,
-                  meta={"lag": cfg.smoother_lag, "bag": os.path.basename(os.path.normpath(bag))})
+                  stub_from=stub_from)
 
 
 def plot(win: Window, png: str, title: str) -> None:
@@ -371,8 +386,9 @@ def plot(win: Window, png: str, title: str) -> None:
     if any(f.inserted_at > kf_by_key[f.keys[0]].k for f in proj):
         bx.plot([], [], c=C_PROJ_INIT, lw=1, label="… inserted at initialization")
     bx.set_aspect("equal", adjustable="datalim")
-    bx.set_xlabel("odom x (m)")
-    bx.set_ylabel("odom y (m)")
+    # The graph frame (odom_graph), called map here: see overview().
+    bx.set_xlabel("map x (m)")
+    bx.set_ylabel("map y (m)")
     bx.grid(alpha=0.3)
     bx.legend(fontsize=8, loc="best")
     bx.set_title("Same window in space (real-time estimates; S and T_j at the window end)",
@@ -387,12 +403,33 @@ def plot(win: Window, png: str, title: str) -> None:
 def overview(bag: str, config, start: Optional[float], end: float,
              windows: List[Tuple[float, float]], png: str, title: str,
              frame_stride: int = 1, view_start: Optional[float] = None,
-             timing: Optional[str] = None) -> None:
+             timing: Optional[str] = None, batch: bool = False,
+             focus_from: Optional[float] = None, direction: bool = False,
+             time_every: float = 30.0, zoom_graph: Optional[float] = None) -> None:
     """Whole-run BEV and time strip with a labelled box per window (see module docstring).
 
     ``view_start`` crops what is drawn to ``view_start .. end`` while the
     estimator still runs from ``start``, so the drawn estimates are the same
     as in a full overview (and in the window plots), just a shorter stretch.
+
+    ``focus_from`` keeps everything drawn but fades what comes before it
+    (alpha ``FAINT``): the earlier route stays as context, the eye goes to
+    ``focus_from .. end``. The tag clouds and their RMS/max circles, the time
+    marks and the start marker then cover the focus stretch only, so the
+    numbers in the legend describe what is in focus. Unlike ``view_start``,
+    nothing is cropped from the axes.
+
+    ``zoom_graph`` (m) fits the BEV to the graph's own content (``X_k``, the
+    batch track, ``S`` and the tags) plus that margin, instead of to
+    everything drawn. For runs where the EKF runs away (a long DVL dropout):
+    its track and tag clouds then leave the frame instead of shrinking the
+    graph track to a dot.
+
+    ``time_every`` (s) spaces the time marks on the graph track. ``direction``
+    puts a triangle at each time mark on the graph and the EKF track
+    (same keyframe on both), pointing the way the AUV travels there
+    (:func:`plotting.direction_marks`); before ``focus_from`` they are faint
+    and unlabelled.
 
     ``timing`` (a label for the machine that ran the node, e.g. "Jetson Orin
     Nano") adds a third panel: the per-keyframe update time of this replay,
@@ -405,7 +442,7 @@ def overview(bag: str, config, start: Optional[float], end: float,
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Circle, Rectangle
+    from matplotlib.patches import Circle
 
     get = getter_from_yaml(config)
     setup = build_setup(get, lambda m: None)
@@ -413,38 +450,95 @@ def overview(bag: str, config, start: Optional[float], end: float,
     # the update time itself is being compared.
     cfg = setup.cfg if timing else dataclasses.replace(setup.cfg, covariance_mode="none")
     t_bag0 = source_start_time(bag)               # seconds into the original recording
-    shift = bag_start_time(bag) - t_bag0
-    rec = []   # (t, X position, E position, has tag factors, tracking, seeded, update ms)
+    rec = []   # (t, X position, E position, has tag factors, tracking, init jump, update ms, k)
     # Where each tag observation puts the tag in odom: the single-image PnP
     # pose T_ct chained onto the EKF pose (E_k T_bc T_ct) and onto the graph's
     # real-time pose (X_k T_bc T_ct). The tag is fixed, so the spread of each
-    # cloud shows how consistent that AUV track is with the camera.
-    tag_E, tag_X, tag_t = [], [], []
+    # cloud shows how consistent that AUV track is with the camera. One cloud
+    # per tag: several tags sit at different places.
+    tag_E, tag_X, tag_t, tag_id = [], [], [], []
+    tag_k, tag_bt = [], []     # per observation: its keyframe, T_bc T_ct (--batch)
+    kf_X = {}                  # k -> real-time X_k pose (--batch LM initial guess)
+    kf_E = {}                  # k -> EKF pose E_k (end camera marker)
 
     def on_kf(est, r, held) -> None:
         rec.append((r.stamp - t_bag0, r.X.translation(), r.E.translation(), bool(r.accepted),
-                    r.state == StationState.TRACKING, r.seeded_from_tag, r.update_time * 1000))
-        for _, cam, T_ct in r.tag_obs:
+                    r.state == StationState.TRACKING, r.init_shift >= INIT_JUMP_M,
+                    r.update_time * 1000, r.k))
+        kf_X[r.k] = r.X
+        kf_E[r.k] = r.E
+        for tag, cam, T_ct in r.tag_obs:
             T_bt = est.cameras[cam].T_bc.compose(T_ct)
             tag_E.append(r.E.compose(T_bt).translation())
             tag_X.append(r.X.compose(T_bt).translation())
             tag_t.append(r.stamp - t_bag0)
+            tag_id.append(tag)
+            tag_k.append(r.k)
+            tag_bt.append(T_bt)
 
     est, _ = replay(bag, get, setup, cfg=cfg, on_keyframe=on_kf,
-                    start=None if start is None else max(0.0, start - shift), end=end - shift,
+                    start=start, end=end,
                     frame_stride=frame_stride)
+    # The anchor (X_0 = E_0) is the first replayed keyframe: there the EKF's
+    # odom and the graph frame coincide (axis labels below).
+    t_anchor = rec[0][0]
     if view_start is not None:
         rec = [r for r in rec if r[0] >= view_start]
         keep = [i for i, ti in enumerate(tag_t) if ti >= view_start]
         tag_E, tag_X = [tag_E[i] for i in keep], [tag_X[i] for i in keep]
+        tag_id = [tag_id[i] for i in keep]
+        tag_k, tag_bt = [tag_k[i] for i in keep], [tag_bt[i] for i in keep]
     t = np.array([r[0] for r in rec])
     X = np.array([r[1] for r in rec])
     E = np.array([r[2] for r in rec])
     tag = np.array([r[3] for r in rec])
     trk = np.array([r[4] for r in rec])
-    seeded = np.array([r[5] for r in rec])
+    jump = np.array([r[5] for r in rec], dtype=bool)
     upd_pc = np.array([r[6] for r in rec])
+    ks = np.array([r[7] for r in rec], dtype=int)
     labels = [chr(ord("A") + i) for i in range(len(windows))]
+    # Focus mask: keyframes drawn at full strength (all of them without --focus-from).
+    fm = t >= focus_from if focus_from is not None else np.ones(len(t), dtype=bool)
+    if not fm.any():
+        raise SystemExit(f"--focus-from {focus_from:g}: no keyframes after it (run ends at {t[-1]:.0f} s)")
+    i_f = int(np.argmax(fm))                      # first keyframe in focus
+
+    def track(P: np.ndarray, m: np.ndarray, **kw) -> None:
+        """Plot a track: faint up to the focus start, full strength from there.
+
+        ``m`` is the focus mask of P's points; the faint part ends on the first
+        focus point so the two pieces join.
+        """
+        if m.all():
+            ax.plot(P[:, 0], P[:, 1], **kw)
+            return
+        j = int(np.argmax(m))
+        faint = {k: v for k, v in kw.items() if k != "label"}
+        ax.plot(P[:j + 1, 0], P[:j + 1, 1], alpha=FAINT, **faint)
+        ax.plot(P[j:, 0], P[j:, 1], **kw)
+
+    # --batch: re-solve the very graph this replay built, once, with LM, from
+    # the real-time estimates (full smoothing; tools/batch_lm.py). The whole
+    # replay initializes it (kf_X, pre-crop), only the drawing is cropped.
+    lm, S_lm = None, None
+    if batch:
+        from .batch_lm import optimize_full_graph
+        result, st = optimize_full_graph(est, kf_X)
+        lm = {int(k): result.atPose3(K.X(int(k))) for k in kf_X if result.exists(K.X(int(k)))}
+        if est.state == StationState.TRACKING and result.exists(K.S):
+            S_lm = result.atPose3(K.S)
+        d = [pose_distance(kf_X[k], lm[k]) for k in sorted(lm)]
+        tp = np.array([x[0] for x in d]) * 100
+        rr = np.degrees([x[1] for x in d])
+        print(f"batch LM: {st['n_factors']} factors, {len(lm)} poses, "
+              f"{st['iterations']} iterations in {st['seconds']:.1f} s; graph error "
+              f"real-time {st['error_init']:.1f} -> LM {st['error_lm']:.1f}")
+        print(f"  X real-time vs LM: position median {np.median(tp):.2f} / max {tp.max():.2f} cm, "
+              f"rotation median {np.median(rr):.2f} / max {rr.max():.2f} deg")
+        S_rt = est.backend.pose(K.S)
+        if S_lm is not None and S_rt is not None:
+            dt_, dr_ = pose_distance(S_rt, S_lm)
+            print(f"  S final real-time vs LM: {dt_ * 100:.2f} cm, {math.degrees(dr_):.2f} deg")
 
     if timing:
         fig, (ax, bx, cx) = plt.subplots(3, 1, figsize=(13, 17), sharex=False,
@@ -453,25 +547,43 @@ def overview(bag: str, config, start: Optional[float], end: float,
         fig, (ax, bx) = plt.subplots(2, 1, figsize=(13, 13), gridspec_kw={"height_ratios": [3, 1]})
 
     # ------------------------------------------------------------ BEV
-    ax.plot(E[:, 0], E[:, 1], ls="--", c=C_EKF, lw=1.1, label="EKF E_k")
+    track(E, fm, ls="--", c=C_EKF, lw=1.1,
+          label=f"EKF E_k (odom coordinates; odom = map at {t_anchor:.0f} s)")
     # The graph track is one solid line through every keyframe; the dots on
     # it mark keyframes with tag factors (red, small, so the line stays readable).
-    ax.plot(X[:, 0], X[:, 1], c=C_X_TAG, lw=1.3, label="graph X_k (real time)")
-    ax.scatter(X[tag, 0], X[tag, 1], s=3, c=C_KF_TAG, linewidths=0, zorder=3)
-    ax.scatter([], [], s=20, c=C_KF_TAG, linewidths=0, label="keyframe with tag factors")
-    # Keyframes whose optimizer starting guess for X_k came from the tag
-    # instead of the odometry chain (DockEstimator._seed_from_tags): the tag
-    # returned after a gap and the drifted odometry guess was far off. Nothing
-    # is reset; these are the visible steps in the real-time track, where the
-    # drift of the gap is corrected at once.
-    if seeded.any():
-        ax.scatter(X[seeded, 0], X[seeded, 1], s=45, marker="D", facecolors="none",
+    track(X, fm, c=C_X_TAG, lw=1.3, label="graph X_k (real time)")
+    ax.scatter(X[tag & fm, 0], X[tag & fm, 1], s=3, c=C_KF_TAG, linewidths=0, zorder=3)
+    ax.scatter(X[tag & ~fm, 0], X[tag & ~fm, 1], s=3, c=C_KF_TAG, alpha=FAINT, linewidths=0,
+               zorder=3)
+    ax.scatter([], [], s=20, c=C_KF_TAG, linewidths=0, label="keyframe with tags")
+    lm_xy = lmm = None
+    if lm:
+        lmm = np.array([int(k) in lm for k in ks])
+        lm_xy = np.array([lm[int(k)].translation() for k in ks if int(k) in lm])
+        track(lm_xy, fm[lmm], ls="-.", c=C_LM, lw=1.2, label="batch LM X_k (smoothed)")
+    # Keyframes whose optimizer starting guess for X_k moved at least
+    # INIT_JUMP_M from the odometry prediction (DockEstimator._init_from_tags):
+    # the tag returned after a gap and the drifted odometry guess was far off.
+    # Nothing is reset; these are the visible steps in the real-time track,
+    # where the drift of the gap is corrected at once.
+    if (jump & ~fm).any():
+        ax.scatter(X[jump & ~fm, 0], X[jump & ~fm, 1], s=45, marker="D", facecolors="none",
+                   edgecolors="magenta", linewidths=1.2, alpha=FAINT, zorder=6)
+    if (jump & fm).any():
+        n_gap = int((jump & fm).sum())
+        ax.scatter(X[jump & fm, 0], X[jump & fm, 1], s=45, marker="D", facecolors="none",
                    edgecolors="magenta", linewidths=1.2, zorder=6,
-                   label=f"tag back after a gap: X_k initial guess from the tag, "
-                         f"not the odometry ({seeded.sum()})")
+                   label=f"tag back after a gap, {n_gap} keyframe{'s' if n_gap != 1 else ''}")
     # Where the two tracks start and end (they coincide at the start: X_0 = E_0).
     ax.scatter([X[0, 0]], [X[0, 1]], s=60, marker="o", c="white", edgecolors="black", zorder=7,
-               label=f"start, {t[0]:.0f} s")
+               alpha=1.0 if fm.all() else FAINT, label=None if not fm.all() else f"start, {t[0]:.0f} s")
+    if not fm.all():
+        # Both tracks enter the focus stretch here, each at its own pose.
+        for P, c in ((X, C_X_TAG), (E, C_EKF)):
+            ax.scatter([P[i_f, 0]], [P[i_f, 1]], s=60, marker="o", c="white", edgecolors=c,
+                       linewidths=1.5, zorder=7)
+        ax.scatter([], [], s=60, marker="o", c="white", edgecolors="black",
+                   label=f"focus start, {t[i_f]:.0f} s (earlier: faint)")
     for P, c, name in ((X, C_X_TAG, "graph"), (E, C_EKF, "EKF")):
         ax.scatter([P[-1, 0]], [P[-1, 1]], s=80, marker="X", c=c, edgecolors="black",
                    linewidths=0.8, zorder=7)
@@ -482,39 +594,67 @@ def overview(bag: str, config, start: Optional[float], end: float,
                     xytext=(-8, 6) if left else (8, -12), ha="right" if left else "left",
                     textcoords="offset points", fontsize=9, color=c, fontweight="bold",
                     bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=1.0))
-    if tag_E:
-        qE, qX = np.array(tag_E), np.array(tag_X)
-
-        def spread(q: np.ndarray) -> Tuple[np.ndarray, float, float]:
-            """Centre, RMS and max horizontal distance (m) of a cloud around its own mean.
-
-            The tag does not move, so ideally every observation lands on one
-            point. The centre is the cloud's own mean (not the graph's tag
-            estimate), so both clouds are measured the same way: consistency
-            only. Horizontal (x-y), to match the bird's-eye view the circles
-            are drawn in (the 3D numbers differ by < 1 mm here).
-            """
-            c = q[:, :2].mean(axis=0)
-            r = np.linalg.norm(q[:, :2] - c, axis=1)
-            return c, float(np.sqrt(np.mean(r ** 2))), float(r.max())
+    # Where the last keyframe leaves each camera, not just base_link: the end
+    # pose chained through T_bc. The offset from the x marker is the lever arm.
+    k_end = int(ks[-1])
+    for kf_map, c, name in ((kf_X, C_X_TAG, "graph"), (kf_E, C_EKF, "EKF")):
+        P3 = kf_map.get(k_end)
+        if P3 is None:
+            continue
+        for cam, cam_setup in est.cameras.items():
+            q = P3.compose(cam_setup.T_bc).translation()
+            ax.scatter([q[0]], [q[1]], marker="^", s=55, c=c, edgecolors="black",
+                       linewidths=0.6, zorder=7)
+            ax.annotate(f"{name} end {cam}", (q[0], q[1]), xytext=(0, 9), ha="center",
+                        textcoords="offset points", fontsize=8, color=c,
+                        bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=1.0))
+    tfm = np.array(tag_t) >= focus_from if focus_from is not None else np.ones(len(tag_t), dtype=bool)
+    if tag_E and not tfm.any():
+        print(f"no tag observations after --focus-from {focus_from:g}: tag clouds left out")
+    if tag_E and tfm.any():
+        # Observations before the focus: faint dots only, no circles.
+        qE_all, qX_all = np.array(tag_E), np.array(tag_X)
+        ax.scatter(qE_all[~tfm, 0], qE_all[~tfm, 1], s=5, c=C_EKF, alpha=0.35 * FAINT,
+                   linewidths=0, zorder=2)
+        ax.scatter(qX_all[~tfm, 0], qX_all[~tfm, 1], s=5, c=C_X_TAG, alpha=0.6 * FAINT,
+                   linewidths=0, zorder=6)
+        qE, qX = qE_all[tfm], qX_all[tfm]
 
         # Graph cloud on top of the (hollow) final tag marker: it is tight
         # enough to hide under it. Empty scatters give readable legend markers.
         ax.scatter(qE[:, 0], qE[:, 1], s=5, c=C_EKF, alpha=0.35, linewidths=0, zorder=2)
         ax.scatter(qX[:, 0], qX[:, 1], s=5, c=C_X_TAG, alpha=0.6, linewidths=0, zorder=6)
-        for q, col, name, expr in ((qE, C_EKF, "EKF", "E_k"), (qX, C_X_TAG, "graph", "X_k")):
-            c, rms, rmax = spread(q)
-            # Filled circle: RMS radius (~63 % of a Gaussian cloud inside),
-            # i.e. exactly the number in the legend. Dashed ring: the max,
-            # which a single outlier sets, so it is only an outline.
-            ax.add_patch(Circle(c, rms, facecolor=col, edgecolor=col, alpha=0.18, lw=1.2, zorder=4))
-            ax.add_patch(Circle(c, rmax, fill=False, edgecolor=col, alpha=0.7, lw=1.0, ls="--",
-                                zorder=4))
+        ids = np.array([tag_key_str(t) for t in tag_id])[tfm]
+        tag_k_f = [k for k, f in zip(tag_k, tfm) if f]
+        tag_bt_f = [bt for bt, f in zip(tag_bt, tfm) if f]
+        methods = [(qE, ids, C_EKF, "EKF"), (qX, ids, C_X_TAG, "graph")]
+        if lm:
+            ok = np.array([int(k) in lm for k in tag_k_f])
+            if ok.any():
+                qLM = np.array([lm[int(k)].compose(bt).translation()
+                                for k, bt in zip(tag_k_f, tag_bt_f) if int(k) in lm])
+                ax.scatter(qLM[:, 0], qLM[:, 1], s=5, c=C_LM, alpha=0.6, linewidths=0, zorder=6)
+                methods.append((qLM, ids[ok], C_LM, "batch LM"))
+        for q, mid, col, name in methods:
+            per_tag = []
+            for tag_name in sorted(set(ids)):
+                c, rms, rmax = cloud_spread(q[mid == tag_name])
+                # Filled circle: RMS radius (~63 % of a Gaussian cloud inside),
+                # i.e. exactly the number in the legend. Dashed ring: the max,
+                # which a single outlier sets, so it is only an outline.
+                # Zoomed on the graph, a runaway EKF's circles (metres) would
+                # cover the whole view: the legend keeps their numbers.
+                if zoom_graph is None or name != "EKF":
+                    ax.add_patch(Circle(c, rms, facecolor=col, edgecolor=col, alpha=0.18, lw=1.2,
+                                        zorder=4))
+                    ax.add_patch(Circle(c, rmax, fill=False, edgecolor=col, alpha=0.7, lw=1.0,
+                                        ls="--", zorder=4))
+                per_tag.append(f"{tag_name} {rms * 100:.1f}/{rmax * 100:.1f}")
+                print(f"tag {tag_name} via {name}: {int((mid == tag_name).sum())} obs, horizontal spread "
+                      f"RMS {rms * 100:.1f} cm, max {rmax * 100:.1f} cm")
+            since = f" (from {focus_from:g} s)" if focus_from is not None else ""
             ax.scatter([], [], s=25, c=col, alpha=0.7, linewidths=0,
-                       label=f"tag via {name}, {expr} T_bc T_ct: spread RMS {rms * 100:.1f} cm "
-                             f"(circle), max {rmax * 100:.1f} cm (dashed)")
-            print(f"tag via {name}: {len(q)} obs, horizontal spread RMS {rms * 100:.1f} cm, "
-                  f"max {rmax * 100:.1f} cm")
+                       label=f"tag cloud via {name}{since}, RMS/max cm:\n" + ", ".join(per_tag))
     S = est.backend.pose(K.S)
     if S is not None:
         s = S.translation()
@@ -531,52 +671,110 @@ def overview(bag: str, config, start: Optional[float], end: float,
                 ax.scatter([q[0]], [q[1]], marker="s", s=70, facecolors="none", edgecolors="black",
                            linewidths=1.4, zorder=5,
                            label="tag S T_j (graph, final)" if i == 0 else None)
-                ax.text(q[0], q[1], f"  {tg[0]}:{tg[1]}", fontsize=9, color="black", va="center")
-    for lab, (w0, w1) in zip(labels, windows):
+                ax.text(q[0], q[1], f"  {tag_key_str(tg)}", fontsize=9, color="black", va="center")
+        # Each final tag seen from each track's end camera, in the camera's
+        # optical axes (x right, y down, z forward): (P_end T_bc)^-1 S T_j.
+        # Both use the graph's S T_j, so the EKF line answers "where would
+        # the tag be in the image if the EKF pose were right".
+        for kf_map, name in ((kf_X, "graph"), (kf_E, "EKF")):
+            P3 = kf_map.get(k_end)
+            if P3 is None:
+                continue
+            for cam, cam_setup in est.cameras.items():
+                for tg in est.tag_index.tags():
+                    T = est.backend.pose(est.tag_index.key(tg))
+                    if T is None:
+                        continue
+                    q = P3.compose(cam_setup.T_bc).inverse().compose(S.compose(T)).translation()
+                    print(f"end {t[-1]:.0f} s, {name} pose: tag {tag_key_str(tg)} in {cam}: "
+                          f"right {q[0]:+.2f}, down {q[1]:+.2f}, forward {q[2]:+.2f} m")
+    if S_lm is not None:
+        d = S_lm.translation()
+        ax.scatter([d[0]], [d[1]], marker="D", s=90, c="#e9d8fd", edgecolors=C_LM,
+                   linewidths=1.2, zorder=5, label="S (dock_point, batch LM)")
+    # Windows that end before the focus are not drawn; they keep their letter,
+    # so the labels match the full overview.
+    shown = [(lab, w) for lab, w in zip(labels, windows)
+             if focus_from is None or w[1] >= focus_from]
+    for lab, (w0, w1) in shown:
         m = (t >= w0) & (t <= w1)
         if not m.any():
             print(f"warning: no keyframes in window {lab} ({w0}-{w1} s)")
             continue
-        pts = np.vstack([X[m, :2], E[m, :2]])   # box covers both tracks in the window
-        lo, hi = pts.min(axis=0), pts.max(axis=0)
-        pad = 0.12
-        size = np.maximum(hi - lo + 2 * pad, 0.35)   # never smaller than 35 cm, stays visible
-        c = 0.5 * (lo + hi)
-        ax.add_patch(Rectangle(c - size / 2, size[0], size[1], fill=False, ec="#1a202c", lw=1.4,
-                               zorder=6))
+        # Label above the box, or below it when the station marker is close
+        # above (the label's white background would hide S).
+        c = 0.5 * (np.vstack([X[m, :2], E[m, :2]]).min(axis=0)
+                   + np.vstack([X[m, :2], E[m, :2]]).max(axis=0))
+        above = S is None or not (abs(S.translation()[0] - c[0]) < 1.0
+                                  and 0 < S.translation()[1] - c[1] < 0.6)
+        window_box(ax, X[m], E[m], f"{lab}: {w0:g}–{w1:g} s", above=above)
         # The track can pass the same place several times: highlight this
         # window's own segment (graph solid, EKF dashed) so the box is unambiguous.
         ax.plot(X[m, 0], X[m, 1], c=C_HL, lw=3.0, zorder=7, solid_capstyle="round")
         ax.plot(E[m, 0], E[m, 1], c=C_HL, lw=2.0, ls="--", zorder=7)
-        # Label above the box, or below it when the station marker is close
-        # above (the label's white background would hide S).
-        above = S is None or not (abs(S.translation()[0] - c[0]) < 1.0
-                                  and 0 < S.translation()[1] - c[1] < 0.6)
-        ly = c[1] + size[1] / 2 + 0.04 if above else c[1] - size[1] / 2 - 0.04
-        ax.text(c[0] - size[0] / 2, ly, f"{lab}: {w0:g}–{w1:g} s",
-                fontsize=10, fontweight="bold", va="bottom" if above else "top", zorder=8,
-                bbox=dict(facecolor="white", edgecolor="none", alpha=0.85, pad=1.5))
+    # Time marks every 30 s on the graph track: the route can cross the same
+    # place several times; the labels make the passes readable in order.
+    time_labels(ax, X[fm], t[fm], every=time_every, color=C_X_TAG)
+    if direction:
+        for P, c in ((X, C_X_TAG), (E, C_EKF)):
+            if not fm.all():
+                direction_marks(ax, P[:i_f + 1], t[:i_f + 1], time_every, c, alpha=FAINT)
+            direction_marks(ax, P[i_f:], t[i_f:], time_every, c)
+        ax.scatter([], [], marker=">", s=40, c="grey", edgecolors="white", linewidths=0.5,
+                   label="direction of travel at the time marks (graph blue, EKF green)")
     ax.set_aspect("equal", adjustable="datalim")
-    ax.set_xlabel("odom x (m)")
-    ax.set_ylabel("odom y (m)")
+    if zoom_graph is not None:
+        pts = [X[:, :2]]
+        if lm_xy is not None:
+            pts.append(lm_xy[:, :2])
+        if S is not None:
+            pts.append(S.translation()[None, :2])
+            pts += [S.compose(est.backend.pose(est.tag_index.key(tg))).translation()[None, :2]
+                    for tg in est.tag_index.tags() if est.backend.pose(est.tag_index.key(tg)) is not None]
+        P = np.vstack(pts)
+        lo, hi = P.min(axis=0) - zoom_graph, P.max(axis=0) + zoom_graph
+        ax.set_xlim(lo[0], hi[0])
+        ax.set_ylim(lo[1], hi[1])
+        print(f"zoom on the graph: x {lo[0]:.1f}..{hi[0]:.1f}, y {lo[1]:.1f}..{hi[1]:.1f} m "
+              f"(EKF track spans x {E[:, 0].min():.1f}..{E[:, 0].max():.1f}, "
+              f"y {E[:, 1].min():.1f}..{E[:, 1].max():.1f} m)")
+    # Axes: the graph frame (the node's odom_graph), called map here: fixed to
+    # the tank, the station is constant in it. X_k, S and the tags are native
+    # to it. E_k is drawn with its odom coordinates as they are: at the anchor
+    # odom = odom_graph, so this is the EKF's dead reckoning from there, and
+    # the gap between the tracks is the drift since. (Converting X_k into
+    # odom through odom -> odom_graph = E_k X_k^-1 would just give E_k back.)
+    ax.set_xlabel(f"map x (m)   [map = odom_graph; = odom at {t_anchor:.0f} s]")
+    ax.set_ylabel("map y (m)")
     ax.grid(alpha=0.3)
-    ax.plot([], [], c=C_HL, lw=3.0, label="window segment (graph solid, EKF dashed)")
-    ax.legend(fontsize=9, loc="best")
+    if shown:
+        ax.plot([], [], c=C_HL, lw=3.0, label="window segment (graph solid, EKF dashed)")
+    ax.scatter([], [], marker="^", s=45, facecolors="none", edgecolors="black",
+               linewidths=0.6, label="end pose, camera (T_bc)")
+    ax.plot([], [], ls="", marker="|", ms=9, c=C_X_TAG, label=f"time marks, {time_every:g} s")
+    ax.legend(fontsize=8, loc="lower right")
 
     # ------------------------------------------------------------ time strip
     # Drift correction: 3D distance between the graph's and the EKF's AUV
     # position at each keyframe (independent of where the odom origin is).
     D = np.linalg.norm(X - E, axis=1)
+    Dlm = np.linalg.norm(lm_xy - E[lmm], axis=1) if lm else None
+    ymax = max(float(D.max()) * 1.15, 0.05)
     bx.plot(t, D, c=C_X_TAG, lw=1.0,
             label="drift correction ‖t(X_k) − t(E_k)‖, 3D (m)")
-    ymax = max(float(D.max()) * 1.15, 0.05)
+    if Dlm is not None:
+        bx.plot(t[lmm], Dlm, ls="-.", c=C_LM, lw=1.0,
+                label="drift correction, batch LM (m)")
     bx.vlines(t[tag], ymax * 0.93, ymax, color=C_KF_TAG, lw=0.4, label="keyframe with tag factors")
     pre = ~trk
     if pre.any():
         bx.axvspan(t[0], t[pre][-1], color="#fbd38d", alpha=0.5, lw=0, label="not yet TRACKING")
-    for lab, (w0, w1) in zip(labels, windows):
+    for lab, (w0, w1) in shown:
         bx.axvspan(w0, w1, color="#1a202c", alpha=0.18, lw=0)
         bx.text(0.5 * (w0 + w1), ymax * 0.82, lab, ha="center", fontsize=10, fontweight="bold")
+    if not fm.all():
+        # Fade the strip before the focus too: a white veil over that stretch.
+        bx.axvspan(t[0], t[i_f], color="white", alpha=1.0 - FAINT, lw=0, zorder=5)
     bx.set_ylim(0, ymax)
     bx.set_xlim(t[0], t[-1])
     bx.set_xlabel("time since recording start (s)")
@@ -594,15 +792,17 @@ def overview(bag: str, config, start: Optional[float], end: float,
 
 
 def _live_update_times(bag: str) -> Dict[float, float]:
-    """``update_ms`` per keyframe stamp from the live node's ``/dock_fuser/keyframe`` (JSON)."""
+    """``update_ms`` per keyframe stamp from the live node's recorded ``~/keyframe`` (JSON)."""
     import json
 
     import rosbag2_py
     from rclpy.serialization import deserialize_message
     from std_msgs.msg import String
-    reader = rosbag2_py.SequentialReader()
-    reader.open(rosbag2_py.StorageOptions(uri=bag), rosbag2_py.ConverterOptions("", ""))
-    reader.set_filter(rosbag2_py.StorageFilter(topics=["/dock_fuser/keyframe"]))
+    reader = open_reader(bag)
+    topic = live_topic("keyframe", {t.name for t in reader.get_all_topics_and_types()})
+    if topic is None:
+        return {}
+    reader.set_filter(rosbag2_py.StorageFilter(topics=[topic]))
     out: Dict[float, float] = {}
     while reader.has_next():
         _, data, _ = reader.read_next()
@@ -620,25 +820,15 @@ def _timing_panel(cx, bag: str, t_bag0: float, t: np.ndarray, upd_pc: np.ndarray
     period (1 / detector rate) is the budget: a longer update makes frames
     queue up (``frames_waiting``) and eventually drop.
     """
-    import platform
     live = _live_update_times(bag)
     if not live:
-        raise SystemExit(f"--timing: no /dock_fuser/keyframe in {bag} (record the live node "
-                         f"with publish_debug: true)")
+        raise SystemExit(f"--timing: no keyframe records of the live node in {bag} (record "
+                         f"~/keyframe with publish_debug: true)")
     t_live = np.array(sorted(live)) - t_bag0
     u_live = np.array([live[k] for k in sorted(live)])
     m = (t_live >= t[0]) & (t_live <= t[-1])
     t_live, u_live = t_live[m], u_live[m]
-    cpu = platform.processor() or platform.machine()
-    try:
-        with open("/proc/cpuinfo", encoding="utf-8") as f:
-            cpu = next(ln.split(":", 1)[1].strip() for ln in f if ln.startswith("model name"))
-    except (OSError, StopIteration):
-        pass
-
-    def stats(u: np.ndarray) -> str:
-        return (f"median {np.median(u):.1f}, p95 {np.percentile(u, 95):.1f}, "
-                f"max {u.max():.1f} ms")
+    cpu, stats = cpu_name(), timing_stats
     cx.plot(t_live, u_live, c="#dd6b20", lw=0.6, alpha=0.9,
             label=f"{live_label}, live node ({stats(u_live)})")
     cx.plot(t, upd_pc, c="#2b6cb0", lw=0.6, alpha=0.9,
@@ -652,7 +842,7 @@ def _timing_panel(cx, bag: str, t_bag0: float, t: np.ndarray, upd_pc: np.ndarray
     cx.set_ylim(lo, budget * 3)
     cx.set_xlim(t[0], t[-1])
     cx.set_xlabel("time since recording start (s)")
-    cx.set_ylabel("dock_fuser update per keyframe (ms)")
+    cx.set_ylabel("factor-graph update per keyframe (ms)")
     cx.legend(fontsize=8, loc="lower left", ncol=1, frameon=False, bbox_to_anchor=(0.0, 1.0))
     cx.grid(alpha=0.3, which="both")
     print(f"update time: live {stats(u_live)} ({len(u_live)} keyframes); "
@@ -662,13 +852,13 @@ def _timing_panel(cx, bag: str, t_bag0: float, t: np.ndarray, upd_pc: np.ndarray
 def main(argv: List[str] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("bag", help="rosbag2 directory with EKF odometry and tag detections")
-    ap.add_argument("--config", required=True, nargs="+", help="dock_fuser parameter file(s), merged in order")
+    ap.add_argument("--config", required=True, nargs="+", help="node parameter file(s), merged in order")
     ap.add_argument("--start", type=float, default=None,
                     help="replay start, s into the original recording (the estimator starts fresh here)")
-    ap.add_argument("--window", type=float, nargs=2, action="append", required=True,
+    ap.add_argument("--window", type=float, nargs=2, action="append", default=[],
                     metavar=("FROM", "TO"),
                     help="time window, s into the original recording (a few seconds). Graph mode: exactly "
-                         "one. Overview: repeat to box several")
+                         "one. Overview: repeat to box several, or leave out for no boxes")
     ap.add_argument("--label", default="", help="graph mode: label in the title, e.g. A")
     ap.add_argument("--overview", type=float, default=None, metavar="END",
                     help="draw the whole run up to END (s into the original recording) with a box per window")
@@ -679,6 +869,21 @@ def main(argv: List[str] = None) -> None:
                     help="overview: add a panel with the per-keyframe update time of this replay "
                          "(this computer) against the live node's, recorded in the bag "
                          "(/dock_fuser/keyframe); LABEL names the machine that ran the node")
+    ap.add_argument("--batch", action="store_true",
+                    help="overview: after the replay, re-solve the same graph once with batch LM "
+                         "(tools/batch_lm.py) and draw the smoothed X_k track, its drift "
+                         "correction and its tag cloud alongside the real-time ones")
+    ap.add_argument("--focus-from", type=float, default=None, metavar="FROM",
+                    help="overview: draw everything before FROM (s into the recording) faint, "
+                         "so FROM..END stands out; tag clouds and time marks cover FROM..END only")
+    ap.add_argument("--direction", action="store_true",
+                    help="overview: a triangle at each time mark on the graph and EKF tracks, "
+                         "pointing the way the AUV travels")
+    ap.add_argument("--zoom-graph", type=float, default=None, metavar="MARGIN",
+                    help="overview: fit the BEV to the graph track, S and the tags plus MARGIN m; "
+                         "an EKF that ran away leaves the frame")
+    ap.add_argument("--time-every", type=float, default=30.0, metavar="SECONDS",
+                    help="overview: spacing of the time marks (and --direction triangles)")
     ap.add_argument("--frame-stride", type=int, default=1,
                     help="keep every Nth detector image, e.g. 3 to replay a 15 Hz bag at 5 Hz")
     ap.add_argument("--out", default="graph.png", help="output image")
@@ -694,16 +899,21 @@ def main(argv: List[str] = None) -> None:
     # with this config's lag (as the node computes it), not a re-smoothing.
     lag = float(getter_from_yaml(args.config)("estimator.smoother_lag"))
     backend = f"\nfixed-lag smoother {lag:g} s, real-time estimates"
+    if args.batch:
+        backend += " + batch LM re-solve of the whole graph"
     if args.overview is not None:
         t0 = (args.view_start if args.view_start is not None
               else args.start if args.start is not None else 0.0)
         overview(args.bag, args.config, args.start, args.overview,
                  [tuple(w) for w in args.window], args.out,
                  f"{name}, {t0:g}–{args.overview:g} s{rate}: "
-                 f"{'part of the run' if args.view_start is not None else 'whole run'}, "
-                 f"with the factor-graph windows{backend}",
+                 f"{'part of the run' if args.view_start is not None else 'whole run'}"
+                 f"{f', focus on {args.focus_from:g}–{args.overview:g} s' if args.focus_from is not None else ''}"
+                 f"{', with the factor-graph windows' if args.window else ''}{backend}",
                  frame_stride=args.frame_stride, view_start=args.view_start,
-                 timing=args.timing)
+                 timing=args.timing, batch=args.batch, focus_from=args.focus_from,
+                 direction=args.direction, time_every=args.time_every,
+                 zoom_graph=args.zoom_graph)
         return
     if len(args.window) != 1:
         ap.error("graph mode takes exactly one --window (use --overview to box several)")

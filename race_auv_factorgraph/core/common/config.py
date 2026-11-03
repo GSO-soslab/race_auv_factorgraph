@@ -85,21 +85,14 @@ class EstimatorConfig:
     min_projection_depth: float = 0.05
 
     # ------------------------------------------------------------------ §8 detections
-    # No gate in the fuser: every detection of a station tag becomes a factor.
+    # No gate in the estimator: every detection of a station tag becomes a factor.
     # The tag detector (race_auv_camera_tag_factorgraph) drops poor quads
     # (border, minimum side, PnP fit) and the Huber kernel above bounds the rest.
 
-    # Tag-implied initial value of X_k (DockEstimator._seed_from_tags): used
-    # when the tag-implied pose fits the accepted tags better than the
-    # odometry prediction X_hat_k AND lies farther from it than
-    # seed_min_shift + range * seed_size_tol_px / side_px: this distance plus
-    # the proposal's own PnP range noise (the range change for an apparent-size
-    # error of seed_size_tol_px pixels). Only the optimizer's starting point
-    # changes, never which measurements are used. A distance, not a pixel threshold: at 0.3 m
-    # range 3 mm is already 10 px. Tank test 30-420 s: steady-tracking
-    # differences are 0.3-1 cm (2 cm max), real drift events 10-12 cm.
-    seed_min_shift: float = 0.05
-    seed_size_tol_px: float = 2.0
+    # The initial value of X_k (DockEstimator._init_from_tags) has no knob of
+    # its own: it minimizes the odometry, station and tag terms with the noise
+    # models of the main graph (odom_*, odom_huber_k, dvl_*, sigma_px,
+    # tag_huber_k) and the docking-pose covariance (covariance_mode below).
 
     # ------------------------------------------------------------------ §6 attached cameras
     # Detections of a camera other than the keyframe camera (node parameter
@@ -150,17 +143,20 @@ class EstimatorConfig:
     init_batch_prior_sigma_trans: float = 0.5
 
     # ------------------------------------------------------------------ §10 output
-    # Covariance published with /dock_point/pose:
+    # Covariance of the docking pose, published with the dock (the node's
+    # ~/dock_state and ~/dock_pose) and used as the station's prior in the
+    # initial value of X_k (DockEstimator._init_from_tags):
     #   "relative": covariance of the docking pose X_k^-1 * S itself, from the
     #               joint marginal of (X_k, S). This is the honest number for
     #               docking. It needs a full gtsam.Marginals pass over the
-    #               smoother's graph (~15 ms at ~800 factors, growing with
-    #               plain iSAM2), so it is refreshed at most every
-    #               `covariance_period` seconds and reused in between.
+    #               smoother's graph (~15 ms at ~800 factors), so it is
+    #               refreshed at most every `covariance_period` seconds and
+    #               reused in between.
     #   "station":  marginal covariance of S alone (cheap). It is expressed in
     #               odom, so it also contains the AUV's accumulated odometry
     #               uncertainty and overstates the docking uncertainty.
-    #   "none":     publish "unknown" (covariance[0] = -1).
+    #   "none":     not computed (published as all zero; the initial value
+    #               then uses a fixed 2 deg / 5 cm station prior).
     covariance_mode: str = "relative"
     covariance_period: float = 1.0
 

@@ -125,25 +125,6 @@ def interpolate(a: gtsam.Pose3, b: gtsam.Pose3, alpha: float) -> gtsam.Pose3:
     return gtsam.Pose3(R, gtsam.Point3(*t))
 
 
-def step_towards(current: gtsam.Pose3, target: gtsam.Pose3,
-                 max_trans: float, max_rot: float) -> gtsam.Pose3:
-    """Move ``current`` toward ``target`` by at most ``max_trans`` m / ``max_rot`` rad.
-
-    Used to rate-limit the published ``odom -> station`` correction (§10) so a
-    controller never sees a jump. The step fraction is the largest one that
-    keeps both the translation and the rotation within their limits.
-    """
-    dt, dr = pose_distance(current, target)
-    frac = 1.0
-    if dt > 1e-12 and max_trans >= 0.0:
-        frac = min(frac, max_trans / dt)
-    if dr > 1e-12 and max_rot >= 0.0:
-        frac = min(frac, max_rot / dr)
-    if frac >= 1.0:
-        return target
-    return interpolate(current, target, frac)
-
-
 # ---------------------------------------------------------------------------
 # Covariance
 # ---------------------------------------------------------------------------

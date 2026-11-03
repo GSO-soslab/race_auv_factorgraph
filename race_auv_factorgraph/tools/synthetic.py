@@ -75,11 +75,6 @@ def default_tags() -> Dict[TagKey, TagModel]:
             for i, (xyz, rpy, size) in spec.items()}
 
 
-def default_T_dock_base() -> gtsam.Pose3:
-    """Station base_link in dock_point: inverse of the URDF dock_point_joint."""
-    return pose_from_xyz_rpy([-0.410, 0.325, -0.04], [3.1415926, 0.0, 0.0]).inverse()
-
-
 # ===========================================================================
 # Scenario
 # ===========================================================================
@@ -144,10 +139,8 @@ class Scenario:
     cfg: ScenarioConfig
     cameras: Dict[str, CameraModel]
     tags: Dict[TagKey, TagModel]
-    T_dock_base: gtsam.Pose3
     S_true: gtsam.Pose3
     odometry: List[Tuple[float, gtsam.Pose3]]           # (stamp, E)
-    truth: Dict[float, gtsam.Pose3]                      # stamp -> X_true
     frames: List[TagFrame]
     dvl: List[float] = field(default_factory=list)       # DVL bottom-lock message stamps
 
@@ -199,11 +192,10 @@ def make_scenario(c: ScenarioConfig = ScenarioConfig()) -> Scenario:
         rng.normal(0, c.mount_error_sigma[0], 3), rng.normal(0, c.mount_error_sigma[1], 3)]))
         for k, t in tags.items()}
 
-    odom, truth = [], {}
+    odom = []
     for i in range(int(c.duration * c.odom_rate) + 1):
         t = i / c.odom_rate
         X = _true_pose(c, S_true, t)
-        truth[t] = X
         E = _drift(c, t).compose(X)
         for d0, d1 in c.dvl_dropouts:   # dead-reckoning drift, gone at re-lock (the snap)
             if d0 <= t < d1:
@@ -214,7 +206,7 @@ def make_scenario(c: ScenarioConfig = ScenarioConfig()) -> Scenario:
            if not any(d0 <= t < d1 for d0, d1 in c.dvl_dropouts)]
     dvl = sorted(dvl + [d1 for _, d1 in c.dvl_dropouts if d1 < c.duration])   # first message back
 
-    # One detector message per camera tick, like apriltag_detector_node: with
+    # One detector message per camera tick, like the tag detector: with
     # the visible tags, or empty (blackout / nothing in view).
     frames: List[TagFrame] = []
     for ci, cam_name in enumerate(c.cameras):
@@ -250,7 +242,7 @@ def make_scenario(c: ScenarioConfig = ScenarioConfig()) -> Scenario:
             frames.append(TagFrame(t, cam_name, dets))
             t += 1.0 / c.camera_rate
     frames.sort(key=lambda f: f.stamp)
-    return Scenario(c, cams, tags, default_T_dock_base(), S_true, odom, truth, frames,
+    return Scenario(c, cams, tags, S_true, odom, frames,
                     [float(t) for t in dvl])
 
 
@@ -293,7 +285,7 @@ def dock_error(scn: Scenario, r: KeyframeResult) -> Tuple[float, float]:
 def main() -> None:  # pragma: no cover - demo
     from ..core.common.config import EstimatorConfig
     scn = make_scenario(ScenarioConfig())
-    est = DockEstimator(EstimatorConfig(), scn.cameras, scn.tags, scn.T_dock_base)
+    est = DockEstimator(EstimatorConfig(), scn.cameras, scn.tags)
     results = run(scn, est)
     first = next((r for r in results if r.initialized_now), None)
     n_tag = sum(1 for f in scn.frames if f.detections)

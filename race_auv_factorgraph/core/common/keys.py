@@ -43,9 +43,6 @@ class TagIndex:
             self._index[tag] = len(self._index)
         return gtsam.symbol("t", self._index[tag])
 
-    def __contains__(self, tag: TagKey) -> bool:
-        return tag in self._index
-
     def tags(self) -> List[TagKey]:
         """All tags that have a key, in order of first use."""
         return list(self._index)

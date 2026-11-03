@@ -26,13 +26,16 @@ setup(
     extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
-            'dock_fuser_node = race_auv_factorgraph.ros.node:main',
+            'factorgraph_node = race_auv_factorgraph.ros.node:main',
             'replay_bag = race_auv_factorgraph.tools.replay_bag:main',
             'evaluate = race_auv_factorgraph.tools.evaluate:main',
             'plot_bev = race_auv_factorgraph.tools.plot_bev:main',
             'plot_graph = race_auv_factorgraph.tools.plot_graph:main',
             'batch_lm = race_auv_factorgraph.tools.batch_lm:main',
             'compare_backends = race_auv_factorgraph.tools.compare_backends:main',
+            'compare_velocity = race_auv_factorgraph.tools.compare_velocity:main',
+            'analyze_run = race_auv_factorgraph.tools.analyze_run:main',
+            'redetect_bag = race_auv_factorgraph.tools.redetect_bag:main',
             'synthetic_demo = race_auv_factorgraph.tools.synthetic:main',
         ],
     },

@@ -24,7 +24,7 @@
     jpeg_quality: 80
     # Raw (distorted) UNDERWATER fisheye calibration
     # (race_auv_bringup/config/camera/camera_parameters/stellar_cam.yaml).
-    # Rectified K, which tank_dock_fuser.yaml matches:
+    # Rectified K, which tank_factorgraph.yaml matches:
     # fx 1165.2372, fy 1164.9232, cx 801.9339, cy 679.6697, 1600x1200.
     intrinsics:
       fx: 1262.74163

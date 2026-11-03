@@ -262,3 +262,8 @@ docs/_build
 
 # Local copy of the TagSLAM paper (not redistributed; linked in docs/DOCK_FUSER_PIPELINE.md §14)
 docs/TagSLAM_*.pdf
+
+# Local copies of cited papers (not redistributed; some are licensed IEEE copies).
+# The README index stays tracked so others know what to fetch.
+docs/references/*
+!docs/references/README.md

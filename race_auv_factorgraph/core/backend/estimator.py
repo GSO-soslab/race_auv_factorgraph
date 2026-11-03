@@ -13,30 +13,34 @@ Per keyframe (:meth:`DockEstimator.process_keyframe`)
 4. **Tag factors.** Every detection of a station tag is used: the per-image
    checks (border, size, PnP fit) already ran in the tag detector, and the
    projection factor's Huber kernel bounds whatever bad detection is left.
-   Its IPPE solutions are computed once here and reused. Then:
+   Each tag's IPPE solutions are computed once here. Then:
 
    * Before ``S`` exists: PnP hypotheses, then buffer the frame for
      initialization (§7).
    * In TRACKING: one projection factor per accepted tag. A tag seen for the
-     first time gets a new ``T_j`` with its URDF prior. If the tag-implied
-     AUV pose explains the corners better than the odometry prediction
-     ``X_hat_k``, it becomes ``X_k``'s initial value (:meth:`_seed_from_tags`).
+     first time gets a new ``T_j`` with its URDF prior. ``X_k``'s initial
+     value is the minimum of the cost restricted to ``X_k``: the odometry
+     prediction ``X_hat_k`` with the drift accumulated since the station was
+     last seen, against these tag factors (:meth:`_init_from_tags`).
 
 5. **Update the smoother.** If initialization succeeds on this keyframe, a second
    update inserts ``S``, the ``T_j`` and **all** buffered projection factors.
    Frames of *attached* cameras received since the previous keyframe
    (:meth:`DockEstimator.add_attached_frame`) whose stamp is not after this
    keyframe are anchored now and their factors go into the same update.
-6. **Read back** ``X_k``, ``S`` and the ``T_j``.
-7. **Output** quantities for the node (§10): the drift correction
-   ``D = X_k * E_k^-1``, the ``odom -> station`` transform ``D^-1 * S`` and the
-   docking pose ``X_k^-1 * S``.
+6. **Read back** ``X_k``, ``S`` and the ``T_j`` into a :class:`KeyframeResult`
+   (plus the docking-pose covariance), from which the node builds its
+   outputs (§10).
 
-GPS-readiness
--------------
-Only two things assume the graph frame is ``odom``: :meth:`add_anchor` (the
-gauge prior ``X_0 = E_0``) and the output transforms built from ``D``. A
-future GPS mode replaces :meth:`add_anchor` and publishes ``D`` as
+Frames
+------
+``E`` (the EKF) is in the EKF's ``odom`` frame. ``X``, ``S`` and the graph's
+other variables are in the graph frame, which the node publishes as
+``odom_graph``: :meth:`add_anchor` pins ``X_0 = E_0``, so the two frames start
+out equal and separate as the tags correct the EKF's drift.
+
+GPS-readiness: only :meth:`add_anchor` ties the graph frame to ``odom``. A
+future GPS mode would anchor to ENU instead and publish ``X_k * E_k^-1`` as
 ``map -> odom``. The rest of the cycle is frame-agnostic.
 """
 
@@ -56,9 +60,10 @@ import numpy as np
 from ..common import keys as K
 from ..common.config import EstimatorConfig
 from ..common.model import CameraModel, Detection, TagFrame, TagKey, TagModel, tag_key_str
-from ..factors.odometry import odometry_factor
-from ..factors.priors import pose_prior, pose_prior_cov
-from ..factors.projection import TagProjectionFactor, reprojection_rms
+from ..factors.odometry import odometry_factor, odometry_step_sigmas
+from ..common.geometry import jac_buffer
+from ..factors.priors import pose_prior, pose_prior_cov, tag_mount_prior
+from ..factors.projection import reprojection_rms, tag_projection_factor
 from ..frontend.dvl_monitor import DvlMonitor
 from ..frontend.pnp import Solution, ippe_tag
 from ..init.solver import BufferedFrame, frame_hypotheses
@@ -66,6 +71,15 @@ from ..init.state_machine import StationInitializer, StationState
 from .smoother import Backend
 
 log = logging.getLogger(__name__)
+
+# Iteration cap of each LM run in _init_from_tags. Runs converge in 3-10
+# iterations; the cap only bounds a pathological case.
+_INIT_LM_MAX_ITERATIONS = 30
+
+# Prior on S (rad, m) where no covariance for it is known: in _init_from_tags
+# without a docking covariance (covariance_mode none), and when the backend is
+# rebuilt after an optimizer failure and S's marginal is unavailable.
+_STATION_PRIOR_SIGMAS = (math.radians(2.0), 0.05)
 
 
 @dataclass
@@ -90,9 +104,9 @@ class KeyframeResult:
     k: int
     stamp: float
     state: StationState
-    X: gtsam.Pose3                       # corrected AUV pose in odom
-    E: gtsam.Pose3                       # EKF pose in odom
-    S: Optional[gtsam.Pose3] = None      # station dock_point in odom (TRACKING only)
+    X: gtsam.Pose3                       # AUV pose, graph frame (the node's odom_graph)
+    E: gtsam.Pose3                       # EKF pose, the EKF's odom frame
+    S: Optional[gtsam.Pose3] = None      # station dock_point, graph frame (TRACKING only)
     # 6x6 covariance (gtsam [rot, trans] order, tangent space of the docking
     # pose X_k^-1 * S); see EstimatorConfig.covariance_mode.
     dock_cov: Optional[np.ndarray] = None
@@ -101,7 +115,10 @@ class KeyframeResult:
     init_note: str = ""                  # why initialization did not (yet) succeed
     initialized_now: bool = False
     recovered: bool = False              # backend was rebuilt on this keyframe
-    seeded_from_tag: bool = False        # X_k started at the tag-implied pose (_seed_from_tags)
+    # Distance (m) between X_k's initial value and the odometry prediction
+    # X_hat_k (_init_from_tags). Millimetres in steady tracking; the drift
+    # of the gap when the tags come back after one. 0 without tag factors.
+    init_shift: float = 0.0
     dvl_extra_sigma: float = 0.0         # extra odometry sigma (m) from a DVL dropout / re-lock
     update_time: float = 0.0             # seconds spent in this keyframe
     # The frame's usable detections as single-image poses: (tag, camera,
@@ -142,6 +159,30 @@ class KeyframeResult:
         """``X_k^-1 * S``: dock_point in the AUV base_link. This is what docking uses."""
         return None if self.S is None else self.X.between(self.S)
 
+    def auv_pose_at(self, E_t: gtsam.Pose3, ekf_trusted: bool = True) -> gtsam.Pose3:
+        """The AUV pose in the graph frame at a later EKF message (EKF pose ``E_t``).
+
+        The graph solves once per keyframe (5 Hz), and a keyframe's result is
+        ready ~140 ms after its image stamp: too late to use as the pose
+        itself (the AUV moved 1-5 cm since, on the 2026-10-22 tank runs).
+        What the graph adds to the EKF changes far more slowly: the
+        correction between the two frames, ``C_k = X_k * E_k^-1`` (the
+        :attr:`drift_correction`), which moves only as fast as the EKF drifts
+        (0.02 cm median per keyframe there). Applied to the EKF pose::
+
+            pose(t) = C_k * E(t) = X_k * (E_k^-1 * E(t))
+
+        the keyframe's pose moved by the motion the EKF measured since. The
+        estimator predicts its next keyframe the same way; it is the usual
+        ROS ``map -> odom`` pattern (slow correction, fast odometry).
+
+        ``ekf_trusted`` False: the DVL lost bottom lock or re-locked since the
+        keyframe. The EKF then dead-reckons in jumps and snaps back on
+        re-lock (23 m on the 10-22 20:46 run), so its motion is not used and
+        the pose is ``X_k`` itself, until a keyframe after the snap is solved.
+        """
+        return self.X.compose(self.E.between(E_t)) if ekf_trusted else self.X
+
 
 class DockEstimator:
     """Factor-graph estimator of the docking station pose.
@@ -155,36 +196,39 @@ class DockEstimator:
     tags
         ``(family, id) -> TagModel`` for every tag on the station that may be
         used. Detections of other tags are ignored.
-    T_dock_base
-        Station ``base_link`` expressed in ``dock_point`` (inverse of the
-        station URDF ``dock_point_joint``). Only used for the
-        ``odom -> station base_link`` output.
     """
 
     def __init__(self, cfg: EstimatorConfig, cameras: Dict[str, CameraModel],
-                 tags: Dict[TagKey, TagModel],
-                 T_dock_base: Optional[gtsam.Pose3] = None) -> None:
+                 tags: Dict[TagKey, TagModel]) -> None:
         self.cfg = cfg
         self.cameras = cameras
         self.tags = tags
-        self.T_dock_base = T_dock_base if T_dock_base is not None else gtsam.Pose3()
         self.backend = Backend(cfg)
         self.tag_index = K.TagIndex()
         self.initializer = StationInitializer(cfg)
         # Fed with DVL bottom-lock message stamps by the node / replay
-        # (add_dvl); inactive (no effect) until the first one arrives.
+        # (estimator.dvl.add); inactive (no effect) until the first one arrives.
         self.dvl = DvlMonitor(cfg)
 
         self.k = -1                                   # index of the last keyframe
         self._prev_stamp: Optional[float] = None
         self._prev_E: Optional[gtsam.Pose3] = None
         self._prev_X: Optional[gtsam.Pose3] = None    # corrected pose of the last keyframe
+        # Covariance (6x6, tangent space of X_k, gtsam [rot, trans] order) of
+        # the odometry accumulated since the last keyframe whose own pose got
+        # tag factors: how far X_hat_k may have drifted from the station since
+        # it was last seen. The prior on X_k in _init_from_tags. Propagated
+        # every keyframe, reset to 0 when X_k gets tag factors.
+        self._drift_cov = np.zeros((6, 6))
+        # Docking-pose covariance (of X^-1 S) at that same keyframe: how well
+        # the station was known relative to the AUV when last seen. The prior
+        # on S in _init_from_tags. None until computed (covariance_mode none).
+        self._station_cov: Optional[np.ndarray] = None
         self.tracking_since: Optional[float] = None
         # Cached docking-pose covariance and when it was computed (it is
         # refreshed at most every cfg.covariance_period seconds).
         self._cov_cache: Optional[np.ndarray] = None
         self._cov_stamp: Optional[float] = None
-        self.last_result: Optional[KeyframeResult] = None
         # Recent keyframes (k, stamp, E_k), for anchoring attached frames.
         self._history: Deque[Tuple[int, float, gtsam.Pose3]] = deque(maxlen=200)
         # Attached frames waiting to be anchored: (stamp, E(t), frame).
@@ -250,6 +294,13 @@ class DockEstimator:
             result.dvl_extra_sigma = dvl_sigma
             graph.add(odometry_factor(K.X(k - 1), xk, self._prev_E, E,
                                       stamp - self._prev_stamp, cfg, dvl_sigma))
+            # Carry the drift covariance over this step. With the EKF step
+            # Delta = E_{k-1}^-1 E_k, an error xi of X_{k-1} (X_{k-1} Exp(xi))
+            # becomes X_k Exp(Ad(Delta^-1) xi), and the step adds its own noise:
+            #     P_k = Ad(Delta^-1) P_{k-1} Ad(Delta^-1)^T + Sigma_step
+            Ad = E.between(self._prev_E).AdjointMap()        # Ad(Delta^-1)
+            sig = odometry_step_sigmas(self._prev_E, E, stamp - self._prev_stamp, cfg, dvl_sigma)
+            self._drift_cov = Ad @ self._drift_cov @ Ad.T + np.diag(sig ** 2)
         values.insert(xk, X_hat)
 
         # ---- 4. Tag factors ----------------------------------------------
@@ -286,6 +337,15 @@ class DockEstimator:
         if pending is not None:
             self._run_initialization(pending, stamp, result)
 
+        # X_k itself got tag factors: it is known relative to the station
+        # again, so the drift since the last sighting starts over. (Attached
+        # frames anchored to an earlier keyframe do not reset it; the larger
+        # covariance only makes the next initial value trust the tags more.)
+        seen = not result.recovered and bool(result.accepted or any(
+            a.accepted and a.anchor_k == k for a in result.attached))
+        if seen:
+            self._drift_cov = np.zeros((6, 6))
+
         # ---- 6. Read back ------------------------------------------------
         self.k = k
         X_k = self.backend.pose(xk)
@@ -298,10 +358,11 @@ class DockEstimator:
         if self.state == StationState.TRACKING:
             result.S = self.backend.pose(K.S)
             result.dock_cov = self._dock_covariance(xk, stamp)
+            if seen and result.dock_cov is not None and np.all(np.isfinite(result.dock_cov)):
+                self._station_cov = result.dock_cov
         self.n_tag_factors += len(result.accepted) + result.n_attached_accepted
         self.n_rejected += len(result.rejected) + sum(len(a.rejected) for a in result.attached)
         result.update_time = time.perf_counter() - t0
-        self.last_result = result
         return result
 
     def add_attached_frame(self, stamp: float, E: gtsam.Pose3, frame: TagFrame) -> None:
@@ -348,7 +409,6 @@ class DockEstimator:
         self._attached_pending = deque((p for p in self._attached_pending if p[0] > stamp),
                                        maxlen=self._attached_pending.maxlen)
         cfg = self.cfg
-        mount_rot = math.radians(cfg.sigma_mount_rot_deg)
         candidates = [*self._history, (k, stamp, E)]
         out: List[AttachedResult] = []
         for t, E_t, frame in due:
@@ -380,16 +440,10 @@ class DockEstimator:
             cam = self.cameras[frame.camera]
             cam_at_anchor = dataclasses.replace(cam, T_bc=E_j.between(E_t).compose(cam.T_bc))
             for d in dets:
-                tkey = self.tag_index.key(d.tag)
-                if not self.backend.exists(tkey) and not values.exists(tkey):
-                    values.insert(tkey, self.tags[d.tag].T_dock_tag)
-                    graph.add(pose_prior(tkey, self.tags[d.tag].T_dock_tag, mount_rot,
-                                         cfg.sigma_mount_trans))
-                    timestamps[tkey] = stamp
-                    log.info("tag %s entered the graph (attached camera)", tag_key_str(d.tag))
-                graph.add(TagProjectionFactor(
-                    K.X(j), K.S, tkey, cam_at_anchor, self.tags[d.tag], d.corners,
-                    cfg.sigma_px, cfg.tag_huber_k, cfg.min_projection_depth).factor)
+                tkey = self._tag_variable(d.tag, graph, values, timestamps, stamp,
+                                          " (attached camera)")
+                graph.add(tag_projection_factor(K.X(j), tkey, cam_at_anchor, self.tags[d.tag],
+                                                d.corners, cfg).factor)
                 r.accepted.append(d.tag)
                 r.tag_obs.append((d.tag, cam_at_anchor.T_bc.compose(sols[d.tag][0][0])))
         return out
@@ -435,8 +489,9 @@ class DockEstimator:
         several frames, and the projection factor's Huber kernel bounds a
         bad detection that remains. A detection is only dropped if its tag
         is not on the station, or if PnP fails on it (a degenerate quad the
-        detector's fit check normally prevents). The solutions are reused by
-        initialization (station hypotheses) and the keyframe seed.
+        detector's fit check normally prevents). The solutions seed the
+        initial value of ``X_k`` in TRACKING (:meth:`_tag_seeds`);
+        initialization solves its own station PnP over all tags (§7.1).
         """
         cam = self.cameras[frame.camera]
         dets: List[Detection] = []
@@ -460,7 +515,7 @@ class DockEstimator:
     def _prepare_init_frame(self, k: int, stamp: float, E: gtsam.Pose3, X_hat: gtsam.Pose3,
                             camera: str, dets: List[Detection],
                             result: KeyframeResult) -> Optional[BufferedFrame]:
-        """PnP hypotheses for gated detections seen before ``S`` exists (§7.1).
+        """PnP hypotheses for the detections of a frame seen before ``S`` exists (§7.1).
 
         ``dets`` are the frame's usable detections. The frame is returned for
         buffering in the initialization window; the caller hands it to
@@ -490,19 +545,17 @@ class DockEstimator:
         values = gtsam.Values()
         timestamps: Dict[int, float] = {K.S: stamp}
         values.insert(K.S, decision.S)
-        mount_rot = math.radians(cfg.sigma_mount_rot_deg)
         for tag, T in decision.T.items():
             tkey = self.tag_index.key(tag)
             # Start from the batch solution; the prior stays at the URDF value.
             values.insert(tkey, T)
-            graph.add(pose_prior(tkey, self.tags[tag].T_dock_tag, mount_rot, cfg.sigma_mount_trans))
+            graph.add(tag_mount_prior(tkey, self.tags[tag], cfg))
             timestamps[tkey] = stamp
         for f in init.frames:
             for d in f.detections:
-                pf = TagProjectionFactor(K.X(f.k), K.S, self.tag_index.key(d.tag),
-                                         self.cameras[f.camera], self.tags[d.tag], d.corners,
-                                         cfg.sigma_px, cfg.tag_huber_k, cfg.min_projection_depth)
-                graph.add(pf.factor)
+                graph.add(tag_projection_factor(K.X(f.k), self.tag_index.key(d.tag),
+                                                self.cameras[f.camera], self.tags[d.tag],
+                                                d.corners, cfg).factor)
                 if f.k == pending.k:
                     result.accepted.append(d.tag)
         try:
@@ -529,53 +582,151 @@ class DockEstimator:
                               result: KeyframeResult) -> None:
         """Add one projection factor per detection, and pick ``X_k``'s initial value.
 
-        1. **Initial value of X_k** (:meth:`_seed_from_tags`). It only sets
-           where the optimizer starts from (the linearization point), never
-           which measurements are used.
-        2. **Factors.** A tag seen for the first time gets a new variable
+        1. **Factors.** A tag seen for the first time gets a new variable
            ``T_j`` at its URDF pose, with the mounting prior.
+        2. **Initial value of X_k** (:meth:`_init_from_tags`), from these same
+           factors. It only sets where the optimizer starts from (the
+           linearization point), never which measurements are used.
+        """
+        cam = self.cameras[camera]
+        factors = []
+        for d in dets:
+            tkey = self._tag_variable(d.tag, graph, values, timestamps, stamp)
+            f = tag_projection_factor(K.X(k), tkey, cam, self.tags[d.tag], d.corners,
+                                      self.cfg).factor
+            graph.add(f)
+            factors.append(f)
+            result.accepted.append(d.tag)
+
+        X_init = self._init_from_tags(k, X_hat, dets, sols, cam, factors)
+        values.update(K.X(k), X_init)
+        result.init_shift = float(np.linalg.norm(X_init.translation() - X_hat.translation()))
+        log.debug("keyframe %d: initial value %.3f m from the odometry prediction",
+                  k, result.init_shift)
+
+    def _tag_variable(self, tag: TagKey, graph: gtsam.NonlinearFactorGraph,
+                      values: gtsam.Values, timestamps: Dict[int, float], stamp: float,
+                      source: str = "") -> int:
+        """Key of ``tag``'s variable ``T_j``. On its first sighting, create it.
+
+        A new ``T_j`` starts at its URDF pose with the mounting prior, in the
+        graph / values / timestamps of the update being built.
+        """
+        tkey = self.tag_index.key(tag)
+        if not self.backend.exists(tkey) and not values.exists(tkey):
+            values.insert(tkey, self.tags[tag].T_dock_tag)
+            graph.add(tag_mount_prior(tkey, self.tags[tag], self.cfg))
+            timestamps[tkey] = stamp
+            log.info("tag %s entered the graph%s", tag_key_str(tag), source)
+        return tkey
+
+    def _init_from_tags(self, k: int, X_hat: gtsam.Pose3, dets: List[Detection],
+                        sols: Dict[TagKey, List[Solution]], cam: CameraModel,
+                        factors: List[gtsam.NonlinearFactor]) -> gtsam.Pose3:
+        """Initial value of ``X_k``: the minimum of the cost around ``X_k`` alone (§8).
+
+        **Why.** The smoother linearizes a new variable at its initial value
+        and takes about one Gauss-Newton step per update. The odometry
+        prediction ``X_hat`` carries all the drift since the station was last
+        seen (a gap, a DVL dropout); starting there costs keyframes of
+        convergence and, at close range, can put corners behind the camera.
+
+        **What.** A small problem in ``X_k``, ``S`` and the ``T_j`` this frame
+        sees, of which only ``X_k`` is kept:
+
+            F = rho_odom(Log(X_hat^-1 X); P) + 1/2 ||Log(S_hat^-1 S)||^2_{C_S}
+                + sum_j 1/2 ||Log(T_hat_j^-1 T_j)||^2_{C_j} + sum_j rho_tag(e_j)
+
+        It is the main graph's cost seen from the last keyframe at which the
+        station was seen, with everything up to that keyframe held fixed:
+
+        * **Odometry**: ``X_hat`` with ``P = self._drift_cov``, the odometry
+          noise accumulated since then (one step in steady tracking, the
+          whole gap after one). The chain of odometry factors folded into one
+          prior, with their Huber kernel (``odom_huber_k``).
+        * **Station**: ``S`` with ``C_S = self._station_cov``, the docking-pose
+          covariance at that keyframe: how well the station was known
+          *relative to the AUV*. Loose right after initialization, so the
+          tags' residual then goes mostly to ``S``; tight once the station has
+          been seen for a while, so it goes to ``X_k``.
+        * **Tags**: each ``T_j`` with its smoother marginal (in the dock frame),
+          or its mounting prior if new; and this keyframe's projection
+          factors, the same objects that go into the main graph.
+
+        Both noise models matter. On the 2026-10-22 20:46 tank run the EKF
+        jumped 0.5-1.4 m within single keyframe steps during a 70 s DVL
+        dropout, while the tags stayed in view:
+
+        * with ``S``'s marginal (graph frame) instead of ``C_S``, which also holds
+          the AUV's own accumulated uncertainty, moving ``S`` was the cheapest
+          way to explain a jump: ``X_k`` stayed near the bad prediction and
+          stepped by up to 70 cm a keyframe later;
+        * with a Gaussian odometry prior instead of the Huber one, it
+          outweighed the (Huber) tags far from the answer: steps up to 54 cm;
+        * with both, up to 34 cm, as with the former translation-only tag
+          seed. On the 09-16 run the docking pose matches that seed as well
+          (vs batch LM: median 0.29 cm, p95 2.74 cm).
+
+        **How.** Levenberg-Marquardt from ``X_hat`` and from each tag's seed
+        (:meth:`_tag_seeds`); the lowest final ``F`` wins (``F`` is not convex:
+        rotation, perspective; a start near the answer avoids a wrong local
+        minimum). LM rather than Gauss-Newton: a step that raises ``F`` is
+        rejected and retried shorter, and diagonal (Marquardt) damping makes
+        that independent of the units. No thresholds: the noise models decide
+        between odometry and tags, as in the main graph.
+
+        Returns ``X_hat`` if every run fails.
         """
         cfg = self.cfg
-        cam = self.cameras[camera]
+        xk = K.X(k)
         S = self.backend.pose(K.S)
         T_est = self.tag_estimates()
+        T = {d.tag: T_est.get(d.tag, self.tags[d.tag].T_dock_tag) for d in dets}
 
-        X_seed = self._seed_from_tags(X_hat, dets, sols, cam, S, T_est)
-        if X_seed is not None:
-            values.update(K.X(k), X_seed)
-            result.seeded_from_tag = True
-            log.info("keyframe %d starts at the tag-implied pose (%.3f m from the odometry "
-                     "prediction)", k,
-                     float(np.linalg.norm(X_seed.translation() - X_hat.translation())))
-
+        graph = gtsam.NonlinearFactorGraph()
+        values = gtsam.Values()
+        # Odometry since the station was last seen, as one robust prior.
+        graph.add(pose_prior_cov(xk, X_hat, self._drift_cov, cfg.odom_huber_k))
+        # The station, as well as it was known relative to the AUV then.
+        values.insert(K.S, S)
+        if self._station_cov is not None:
+            graph.add(pose_prior_cov(K.S, S, self._station_cov))
+        else:
+            graph.add(pose_prior(K.S, S, *_STATION_PRIOR_SIGMAS))
+        # The tags this frame sees, and their projection factors.
         mount_rot = math.radians(cfg.sigma_mount_rot_deg)
         for d in dets:
             tkey = self.tag_index.key(d.tag)
-            if not self.backend.exists(tkey) and not values.exists(tkey):
-                # First sighting of this tag: new T_j at its URDF pose, with its prior.
-                values.insert(tkey, self.tags[d.tag].T_dock_tag)
-                graph.add(pose_prior(tkey, self.tags[d.tag].T_dock_tag, mount_rot,
-                                     cfg.sigma_mount_trans))
-                timestamps[tkey] = stamp
-                log.info("tag %s entered the graph", tag_key_str(d.tag))
-            graph.add(TagProjectionFactor(K.X(k), K.S, tkey, cam, self.tags[d.tag], d.corners,
-                                          cfg.sigma_px, cfg.tag_huber_k,
-                                          cfg.min_projection_depth).factor)
-            result.accepted.append(d.tag)
+            if not values.exists(tkey):
+                values.insert(tkey, T[d.tag])
+                graph.add(self.backend.marginal_prior(tkey, T[d.tag], mount_rot,
+                                                      cfg.sigma_mount_trans))
+        for f in factors:
+            graph.add(f)
 
-    def _seed_from_tags(self, X_hat: gtsam.Pose3, dets: List[Detection],
-                        sols: Dict[TagKey, List[Solution]],
-                        cam: CameraModel, S: gtsam.Pose3,
-                        T_est: Dict[TagKey, gtsam.Pose3]) -> Optional[gtsam.Pose3]:
-        """Tag-implied AUV pose, if it explains the corners better than ``X_hat``.
+        params = gtsam.LevenbergMarquardtParams()
+        params.setDiagonalDamping(True)
+        params.setMaxIterations(_INIT_LM_MAX_ITERATIONS)
+        values.insert(xk, X_hat)
+        best, best_F = X_hat, math.inf
+        for X0 in [X_hat] + self._tag_seeds(X_hat, dets, sols, cam, S, T):
+            values.update(xk, X0)
+            try:
+                sol = gtsam.LevenbergMarquardtOptimizer(graph, values, params).optimize()
+            except RuntimeError as e:
+                log.debug("keyframe %d: initial-value LM failed from one start (%s)", k, e)
+                continue
+            F = graph.error(sol)
+            if F < best_F:
+                best, best_F = sol.atPose3(xk), F
+        return best
 
-        ``X_hat`` chains the EKF motion from the previous keyframe, so after
-        a while without tags (or a DVL dropout) it carries all the drift since
-        then. The smoother (iSAM2 inside) linearizes a new variable at its
-        initial value; starting far from the answer costs iterations and, at
-        close range, can put
-        corners behind the camera. Each accepted tag gives a better
-        starting point.
+    def _tag_seeds(self, X_hat: gtsam.Pose3, dets: List[Detection],
+                   sols: Dict[TagKey, List[Solution]], cam: CameraModel,
+                   S: gtsam.Pose3, T: Dict[TagKey, gtsam.Pose3]) -> List[gtsam.Pose3]:
+        """One AUV pose per tag, near the answer even when ``X_hat`` has drifted.
+
+        Starting points for :meth:`_init_from_tags`, next to ``X_hat`` itself.
 
         **Translation only.** Inverting the full PnP pose,
         ``X = S T_j T_ct^-1 T_bc^-1``, multiplies the PnP *rotation* error by
@@ -584,54 +735,22 @@ class DockEstimator:
         precise (exact bearing, 1-3 % range error, the same for both IPPE
         solutions). So the predicted orientation ``R = R_X_hat`` is kept
         (roll and pitch follow the EKF's gravity-referenced tilt through the
-        odometry chain; yaw drift is small and the factors
-        correct it), and only the translation is solved so that the tag
-        centre lands where the camera measured it:
+        odometry chain; yaw drift is small, and LM refines all six DoF), and
+        only the translation is solved so that the tag centre lands where the
+        camera measured it:
 
             R (R_bc p_ct + t_bc) + t = p_tag    =>    t = p_tag - R (R_bc p_ct + t_bc)
 
-        with ``p_tag`` the tag centre in odom from the current ``S * T_j``.
-
-        **Choice.** Poses are scored by the mean reprojection RMS of all
-        accepted tags. The best-scoring candidate (one per tag) is returned
-        if it beats ``X_hat`` *and* lies farther from it than its own
-        uncertainty, ``seed_min_shift + range * seed_size_tol_px / side_px``
-        (5 cm plus the PnP range noise of that tag: the range change for an
-        apparent-size error of ``seed_size_tol_px``); otherwise ``None`` (keep
-        ``X_hat``). Without the distance
-        threshold the candidate "wins" on most frames by a fraction of a
-        pixel (it fits this frame's tag exactly, while ``X_hat`` carries a
-        few mm of odometry noise), which is harmless but makes the flag
-        meaningless. The threshold is a distance, not pixels, because the
-        pixel size of a given error grows as 1 / range: in the tank test a
-        5 px threshold fired on 740 keyframes, 666 of them for sub-cm
-        differences at under 0.8 m range.
+        with ``p_tag`` the tag centre (graph frame) from the current ``S * T_j``.
         """
-        def score(X: gtsam.Pose3) -> float:
-            return float(np.mean([
-                reprojection_rms(X, S, T_est.get(d.tag, self.tags[d.tag].T_dock_tag),
-                                 cam, self.tags[d.tag], d.corners) for d in dets]))
-
-        best_score = score(X_hat)
         R = X_hat.rotation()
-        best, best_tol = None, 0.0
+        seeds = []
         for d in dets:
             p_ct = sols[d.tag][0][0].translation()                    # tag centre in the camera
-            p_tag = S.compose(T_est.get(d.tag, self.tags[d.tag].T_dock_tag)).translation()
+            p_tag = S.compose(T[d.tag]).translation()                 # tag centre, graph frame
             t = p_tag - R.rotate(cam.T_bc.transformFrom(p_ct))       # camera offset in body, rotated
-            X_cand = gtsam.Pose3(R, gtsam.Point3(*t))
-            sc = score(X_cand)
-            if sc < best_score:
-                # The proposal is itself uncertain by the PnP range noise
-                # (range ~ f * size / side, so d range = range * d side / side).
-                rng = float(np.linalg.norm(p_ct))
-                tol = self.cfg.seed_min_shift + rng * self.cfg.seed_size_tol_px / max(
-                    d.min_side_px(), 1.0)
-                best, best_score, best_tol = X_cand, sc, tol
-        if best is None:
-            return None
-        shift = float(np.linalg.norm(best.translation() - X_hat.translation()))
-        return best if shift > best_tol else None
+            seeds.append(gtsam.Pose3(R, gtsam.Point3(*t)))
+        return seeds
 
     def _dock_covariance(self, xk: int, stamp: float) -> Optional[np.ndarray]:
         """Covariance of the docking pose ``X_k^-1 * S`` (see ``covariance_mode``).
@@ -639,7 +758,7 @@ class DockEstimator:
         "relative": with the joint marginal ``C`` of ``(X_k, S)`` and the
         Jacobians ``H1, H2`` of ``between(X_k, S)``, the first-order
         covariance of the relative pose is ``[H1 H2] C [H1 H2]^T``. It
-        correctly cancels the AUV's absolute (odom) uncertainty, which is
+        correctly cancels the AUV's absolute (graph-frame) uncertainty, which is
         shared by ``X_k`` and ``S`` and does not affect docking.
         """
         cfg = self.cfg
@@ -655,8 +774,7 @@ class DockEstimator:
             joint = self.backend.joint_marginal_covariance([xk, K.S])
             X, S = self.backend.pose(xk), self.backend.pose(K.S)
             if joint is not None and X is not None and S is not None:
-                H1 = np.zeros((6, 6), order="F")
-                H2 = np.zeros((6, 6), order="F")
+                H1, H2 = jac_buffer(6, 6), jac_buffer(6, 6)
                 X.between(S, H1, H2)
                 A = np.hstack([H1, H2])
                 cov = A @ joint @ A.T
@@ -684,12 +802,6 @@ class DockEstimator:
         S = old.pose(K.S) if tracking else None
         T_vals = {tag: old.pose(self.tag_index.key(tag)) for tag in self.tag_index.tags()}
 
-        def prior(key: int, value: gtsam.Pose3, s_rot: float, s_tr: float):
-            cov = old.marginal_covariance(key)
-            if cov is not None and np.all(np.isfinite(cov)):
-                return pose_prior_cov(key, value, cov)
-            return pose_prior(key, value, s_rot, s_tr)
-
         xk = K.X(k)
         graph = gtsam.NonlinearFactorGraph()
         values = gtsam.Values()
@@ -706,7 +818,7 @@ class DockEstimator:
             graph.add(pose_prior(xk, X_hat, math.radians(1.0), 0.05))
         if tracking and S is not None:
             values.insert(K.S, S)
-            graph.add(prior(K.S, S, math.radians(2.0), 0.05))
+            graph.add(old.marginal_prior(K.S, S, *_STATION_PRIOR_SIGMAS))
             timestamps[K.S] = stamp
             mount_rot = math.radians(cfg.sigma_mount_rot_deg)
             for tag, T in T_vals.items():
@@ -714,7 +826,7 @@ class DockEstimator:
                     continue
                 tkey = self.tag_index.key(tag)
                 values.insert(tkey, T)
-                graph.add(prior(tkey, T, mount_rot, cfg.sigma_mount_trans))
+                graph.add(old.marginal_prior(tkey, T, mount_rot, cfg.sigma_mount_trans))
                 timestamps[tkey] = stamp
 
         self.backend = Backend(cfg)

@@ -42,24 +42,36 @@ def odometry_sigmas(dt: float, dd: float, cfg: EstimatorConfig) -> np.ndarray:
     return np.array([s_rot] * 3 + [s_tr] * 3)
 
 
+def odometry_step_sigmas(E_prev: gtsam.Pose3, E_cur: gtsam.Pose3, dt: float,
+                         cfg: EstimatorConfig, extra_sigma_trans: float = 0.0) -> np.ndarray:
+    """Sigmas ``[rx, ry, rz, tx, ty, tz]`` of the EKF step from ``E_prev`` to ``E_cur``.
+
+    This is the noise of :func:`odometry_factor`. The estimator also
+    accumulates it between tag sightings (``DockEstimator._drift_cov``).
+    ``extra_sigma_trans`` (m) is added in quadrature to the translation
+    sigma: the DVL monitor's distrust of this step (bottom lock lost, or the
+    EKF snap when it returns; see ``core/frontend/dvl_monitor.py``).
+    Rotation keeps its normal sigma: the EKF's dead-reckoning error and its
+    snap are position-only (yaw comes from the IMU).
+    """
+    dd = float(np.linalg.norm(E_prev.between(E_cur).translation()))
+    sig = odometry_sigmas(dt, dd, cfg)
+    if extra_sigma_trans > 0.0:
+        sig[3:] = np.sqrt(sig[3:] ** 2 + extra_sigma_trans ** 2)
+    return sig
+
+
 def odometry_factor(key_prev: int, key_cur: int,
                     E_prev: gtsam.Pose3, E_cur: gtsam.Pose3,
                     dt: float, cfg: EstimatorConfig,
                     extra_sigma_trans: float = 0.0) -> gtsam.BetweenFactorPose3:
     """Between factor carrying the EKF motion from ``E_prev`` to ``E_cur``.
 
-    ``extra_sigma_trans`` (m) is added in quadrature to the translation
-    sigma: the DVL monitor's distrust of this step (bottom lock lost, or the
-    EKF snap when it returns; see ``core/frontend/dvl_monitor.py``). The
-    step is then barely trusted, and tag observations (when there are any)
-    decide where the robot is. Rotation keeps its normal sigma: the EKF's
-    dead-reckoning error and its snap are position-only (yaw comes from the
-    IMU).
+    Its noise is :func:`odometry_step_sigmas`. With ``extra_sigma_trans``
+    from the DVL monitor the step is barely trusted, and tag observations
+    (when there are any) decide where the robot is.
     """
     Z = E_prev.between(E_cur)  # E_prev^-1 * E_cur
-    dd = float(np.linalg.norm(Z.translation()))
-    sig = odometry_sigmas(dt, dd, cfg)
-    if extra_sigma_trans > 0.0:
-        sig[3:] = np.sqrt(sig[3:] ** 2 + extra_sigma_trans ** 2)
-    noise = gtsam.noiseModel.Diagonal.Sigmas(sig)
+    noise = gtsam.noiseModel.Diagonal.Sigmas(
+        odometry_step_sigmas(E_prev, E_cur, dt, cfg, extra_sigma_trans))
     return gtsam.BetweenFactorPose3(key_prev, key_cur, Z, huber(noise, cfg.odom_huber_k))

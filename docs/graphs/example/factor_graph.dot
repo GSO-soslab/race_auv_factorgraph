@@ -1,0 +1,87 @@
+// Factor graph example for DOCK_FUSER_PIPELINE.md (§5) and DOCK_FUSER_FACTOR_GRAPH.md.
+// Render:  neato -n2 -Tsvg factor_graph.dot -o factor_graph.svg
+//          neato -n2 -Tpng -Gdpi=135 -Gsize=20,20 factor_graph.dot -o factor_graph.png   (PNG ~1600 px wide, for slides)
+//          add -Gbgcolor=transparent and -o factor_graph_transparent.png for the transparent copy
+//
+// Scenario: one tag j, four keyframes, through initialization.
+//   X0  no tag in view (NO_STATION): odometry only.
+//   X1  tag j seen, station not known yet (CANDIDATE): the frame is only
+//       buffered (PnP hypotheses), no factor yet.
+//   X2  tag j seen again; initialization accepts here. One backend update
+//       inserts S, T_j, its URDF prior and the projection factors of ALL
+//       buffered frames (X1 and X2): drawn orange, like plot_graph's
+//       "inserted at initialization".
+//   X3  TRACKING: tag j seen, its projection factor goes in at once (red).
+// The EKF poses E_k are not variables: they are the measurements inside the
+// EKF-init and odometry factors, named in those factors' labels.
+// Positions are in points (72 per inch) and pinned (neato -n2).
+// Labels use Unicode sub/superscripts (X₀, E₀⁻¹E₁, Tⱼ), not HTML sub/sup tags:
+// Graphviz writes those as separate SVG text pieces with baseline-shift, which
+// markdown previews ignore, so the pieces overlapped.
+
+graph factor_graph {
+  graph [bgcolor="white", pad="0.3", splines=false, outputorder="edgesfirst", size="7,10"];  // size: display width in inches
+  node  [fontname="Helvetica", fontsize=20];
+  edge  [color="#555555", penwidth=1.4];
+
+  // ---------------- Variables (circles) ----------------
+  node [shape=circle, width=0.8, fixedsize=true, style=filled, penwidth=1.6];
+  X0 [label="X₀", pos="100,240", fillcolor="#dbe9f6", color="#2b6cb0"];
+  X1 [label="X₁", pos="300,240", fillcolor="#dbe9f6", color="#2b6cb0"];
+  X2 [label="X₂", pos="500,240", fillcolor="#dbe9f6", color="#2b6cb0"];
+  X3 [label="X₃", pos="700,240", fillcolor="#dbe9f6", color="#2b6cb0"];
+  S  [label="S",             pos="400,115", fillcolor="#fde2c8", color="#c05621"];
+  Tj [label="Tⱼ", pos="400,25",  fillcolor="#d5f0dc", color="#2f855a"];
+
+  // ---------------- Factors (small squares) ----------------
+  node [shape=square, width=0.17, fixedsize=true, style=filled, label="", penwidth=0, fontsize=18];
+
+  // EKF init prior: X0 = E0, the EKF pose when the graph starts (first keyframe only)
+  g0  [pos="5,240",  fillcolor="#1a202c"];
+
+  // Odometry (relative pose between consecutive keyframes), measurement E_{k-1}^-1 E_k
+  o01 [pos="200,240", fillcolor="#2b6cb0"];
+  o12 [pos="400,240", fillcolor="#2b6cb0"];
+  o23 [pos="600,240", fillcolor="#2b6cb0"];
+
+  // Tag projection (ternary: X_k, S, T_j), one per tag observation.
+  // Orange: buffered before S existed, inserted at initialization (X2's update).
+  p1 [pos="300,165", fillcolor="#dd6b20", xlabel="proj (at init)"];
+  p2 [pos="500,165", fillcolor="#dd6b20", xlabel="proj (at init)"];
+  // Red: TRACKING, inserted at its own keyframe.
+  p3 [pos="700,165", fillcolor="#c53030", xlabel="proj"];
+
+  // Tag URDF prior: T_j at its station-URDF pose, sigma = mounting tolerance (inserted at init)
+  mj [pos="490,25", fillcolor="#2f855a", xlabel="URDF"];
+
+  // ---------------- Labels of the EKF factors (plain text, pinned above each square) ----------------
+  // Separate nodes instead of xlabels: neato shrinks and shifts xlabels to avoid
+  // overlaps, which made the E_k terms unreadable. They name the measurement
+  // each factor carries: E_k is not a variable, it lives inside these factors.
+  node [shape=plaintext, width=1.2, height=0.6, style="", fontsize=19, fontcolor="#1a202c", label=""];
+  lg0 [pos="5,283",   label="EKF init\nX₀ = E₀"];
+  l01 [pos="200,283", label="odom\nE₀⁻¹E₁"];
+  l12 [pos="400,283", label="odom\nE₁⁻¹E₂"];
+  l23 [pos="600,283", label="odom\nE₂⁻¹E₃"];
+
+  // ---------------- Station state per keyframe (plain text) ----------------
+  node [shape=plaintext, width=2.0, height=0.6, style="", fontsize=17, fontcolor="#4a5568", label=""];
+  st0 [pos="100,340", label="NO_STATION"];
+  st1 [pos="300,340", label="CANDIDATE\n(buffered)"];
+  st2 [pos="500,340", label="initialized\nhere"];
+  st3 [pos="700,340", label="TRACKING"];
+
+  // ---------------- Edges ----------------
+  g0 -- X0;
+  X0 -- o01 -- X1;  X1 -- o12 -- X2;  X2 -- o23 -- X3;
+
+  // projection factors: keyframe edge (blue), station edge (orange), tag edge (green)
+  X1 -- p1 [color="#2b6cb0"];  p1 -- S [color="#c05621"];  p1 -- Tj [color="#2f855a"];
+  X2 -- p2 [color="#2b6cb0"];  p2 -- S [color="#c05621"];  p2 -- Tj [color="#2f855a"];
+  X3 -- p3 [color="#2b6cb0"];  p3 -- S [color="#c05621"];  p3 -- Tj [color="#2f855a"];
+
+  // No S -- Tj edge: no factor connects them. T_j is tag j's pose in S's frame
+  // (dock_point), drawn under S for that reason; the two meet only inside
+  // each proj factor, as the product S * T_j (the tag in the graph frame).
+  Tj -- mj;
+}

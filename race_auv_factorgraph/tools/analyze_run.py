@@ -17,7 +17,7 @@ detector message):
 ``E_k``     the EKF, **recorded** (``/race_auv/odometry/filtered``,
             interpolated at the keyframe stamp, exactly as the node does);
 ``X_rt``    the node's fixed-lag smoother, **recorded** live
-            (``/dock_fuser/auv_pose``, ``publish_debug: true``): the
+            (``~/auv_pose``, ``publish_debug: true``): the
             real-time estimate, as known at keyframe k;
 ``X_lm``    batch Levenberg-Marquardt over the **whole** run (full
             smoothing): every ``X_k`` also uses tag observations made after it.
@@ -38,8 +38,9 @@ Outputs (in ``out_dir``)
 ``overview.png``
     The docs' overview figure (``plot_graph --overview``) for a live run.
     Top left: bird's-eye view of ``E_k``, ``X_rt`` and ``X_lm``; a yellow band
-    where the keyframes had tag factors, and the keyframes seeded from the
-    tag (from the live ``/dock_fuser/keyframe``); the final station ``S``
+    where the keyframes had tag factors, and the keyframes whose initial
+    value jumped when the tag came back after a gap (from the live
+    ``~/keyframe``); the final station ``S``
     (live and LM) and tags; a labelled box per window; and every tag
     observation chained onto each track (``E_k T_bc T_ct``, ``X_k T_bc
     T_ct``): the tag does not move, so the spread of each cloud measures how
@@ -100,12 +101,17 @@ if __package__ in (None, ""):
     __package__ = "race_auv_factorgraph.tools"
 
 from ..core.common import keys as K
-from ..core.common.geometry import pose_distance, pose_from_quat_xyzw
+from ..core.common.model import tag_key_str
+from ..core.common.geometry import pose_distance
 from ..core.frontend.pose_buffer import PoseBuffer
 from ..core.init.state_machine import StationState
 from ..ros.params import build_setup, getter_from_yaml
 from .batch_lm import optimize_full_graph
-from .replay_bag import _open_reader, bag_source, bag_start_time, replay, source_start_time
+from ..ros.msgs import pose_from_msg, stamp_to_sec
+from .bag import (INIT_JUMP_M, LIVE_TOPICS, bag_source, is_init_jump, live_topic,
+                  open_reader, source_start_time)
+from .plotting import cloud_spread, cpu_name, timing_stats, window_box
+from .replay_bag import replay
 
 # The three tracks, Okabe-Ito colours (colour-blind safe, far apart in hue).
 C_E = "#009E73"           # EKF: bluish green, dashed
@@ -158,9 +164,11 @@ DEFAULTS: Dict[str, Any] = {
     "replay_track": "auto",
     "topics": {                      # recorded topics of the live run
         "ekf": "/race_auv/odometry/filtered",
-        "auv_pose": "/dock_fuser/auv_pose",
-        "station_pose": "/dock_fuser/station_pose",
-        "keyframe": "/dock_fuser/keyframe",
+        # null: whichever the bag has, the node's current topic or its former
+        # /dock_fuser/... name (replay_bag.LIVE_TOPICS).
+        "auv_pose": None,
+        "station_pose": None,
+        "keyframe": None,
         "dvl": None,                 # bottom-lock velocity; None: the config's dvl_topic, "": off
     },
     "batch": {
@@ -221,7 +229,7 @@ def write_overrides(cfg: Dict[str, Any]) -> None:
     import yaml
     path = os.path.join(cfg["out_dir"], "dock_fuser_overrides.yaml")
     with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump({"dock_fuser": {"ros__parameters": cfg["dock_fuser_overrides"]}}, f,
+        yaml.safe_dump({"race_auv_factorgraph": {"ros__parameters": cfg["dock_fuser_overrides"]}}, f,
                        sort_keys=False)
     cfg["dock_fuser_config"].append(path)
 
@@ -249,10 +257,6 @@ def load_run_config(path: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------- data
 
 
-def _stamp(header) -> float:
-    return float(header.stamp.sec) + 1e-9 * float(header.stamp.nanosec)
-
-
 def dvl_gaps(stamps: List[float], timeout: float, t0: float) -> List[Tuple[float, float]]:
     """Bottom-lock dropouts: spans (s into the recording) with no DVL message for > ``timeout``.
 
@@ -278,18 +282,20 @@ class Recorded:
     E: PoseBuffer = field(default_factory=lambda: PoseBuffer(max_age=1e12))
     X: Dict[float, gtsam.Pose3] = field(default_factory=dict)      # stamp -> live X_rt
     S: Dict[float, gtsam.Pose3] = field(default_factory=dict)      # stamp -> live S_rt
-    kf: Dict[float, dict] = field(default_factory=dict)            # stamp -> /dock_fuser/keyframe
+    kf: Dict[float, dict] = field(default_factory=dict)            # stamp -> ~/keyframe record
     dvl: List[float] = field(default_factory=list)                  # DVL bottom-lock stamps
 
 
 def read_recorded(bag: str, topics: Dict[str, str]) -> Recorded:
-    """One pass over the bag's EKF and dock_fuser debug topics (all the bag holds of them)."""
+    """One pass over the bag's EKF and the live node's analysis topics (all the bag holds of them)."""
     import rosbag2_py
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
 
-    reader = _open_reader(bag)
+    reader = open_reader(bag)
     types = {t.name: t.type for t in reader.get_all_topics_and_types()}
+    topics = {role: live_topic(role, types) if t is None and role in LIVE_TOPICS else t
+              for role, t in topics.items()}
     wanted = {role: t for role, t in topics.items() if t}
     missing = [t for t in wanted.values() if t not in types]
     if missing:
@@ -303,17 +309,14 @@ def read_recorded(bag: str, topics: Dict[str, str]) -> Recorded:
         msg = deserialize_message(data, cls[topic])
         role = by_topic[topic]
         if role == "dvl":
-            rec.dvl.append(_stamp(msg.header))
+            rec.dvl.append(stamp_to_sec(msg.header.stamp))
             continue
         if role == "keyframe":
             j = json.loads(msg.data)
             rec.kf[_key(j["stamp"])] = j
             continue
-        pose = msg.pose.pose if role == "ekf" else msg.pose
-        P = pose_from_quat_xyzw((pose.position.x, pose.position.y, pose.position.z),
-                                (pose.orientation.x, pose.orientation.y, pose.orientation.z,
-                                 pose.orientation.w))
-        t = _stamp(msg.header)
+        P = pose_from_msg(msg)
+        t = stamp_to_sec(msg.header.stamp)
         if role == "ekf":
             rec.E.add(t, P)
         elif role == "auv_pose":
@@ -334,7 +337,7 @@ class Batch:
     X_lm: Dict[int, gtsam.Pose3] = field(default_factory=dict)
     accepted: Dict[int, bool] = field(default_factory=dict)
     tracking: Dict[int, bool] = field(default_factory=dict)
-    seeded: Dict[int, bool] = field(default_factory=dict)
+    init_jump: Dict[int, bool] = field(default_factory=dict)
     update_ms: Dict[int, float] = field(default_factory=dict)
     S_replay: Dict[int, gtsam.Pose3] = field(default_factory=dict)  # replay's S at keyframe k
     # (k, tag, camera, T_bt): body -> tag of every usable observation (single-
@@ -350,7 +353,7 @@ class Batch:
     lag: float = float("nan")
 
 
-def run_batch(cfg: Dict[str, Any], setup, get, shift: float) -> Batch:
+def run_batch(cfg: Dict[str, Any], setup, get) -> Batch:
     """Replay the recorded detections + EKF through the estimator, then LM on the full graph."""
     est_cfg = setup.cfg if cfg["timing"]["replay"] else dataclasses.replace(
         setup.cfg, covariance_mode="none")
@@ -361,7 +364,7 @@ def run_batch(cfg: Dict[str, Any], setup, get, shift: float) -> Batch:
         b.X_replay[r.k] = r.X
         b.accepted[r.k] = bool(r.accepted)
         b.tracking[r.k] = r.state == StationState.TRACKING
-        b.seeded[r.k] = bool(r.seeded_from_tag)
+        b.init_jump[r.k] = r.init_shift >= INIT_JUMP_M
         b.update_ms[r.k] = r.update_time * 1000.0
         if r.S is not None:
             b.S_replay[r.k] = r.S
@@ -375,13 +378,9 @@ def run_batch(cfg: Dict[str, Any], setup, get, shift: float) -> Batch:
                 b.seen_tags.add(tag)
                 b.tag_obs.append((a.anchor_k, tag, a.camera, T_bt))
 
-    # replay() windows by seconds from the bag's own start; cfg times are
-    # seconds into the recording, hence the shift.
-    start = None if cfg["start"] is None else max(0.0, cfg["start"] - shift)
-    end = None if cfg["end"] is None else cfg["end"] - shift
     print("replaying the recorded detections through the estimator...")
-    est, sched = replay(cfg["bag"], get, setup, cfg=est_cfg, on_keyframe=on_kf, start=start,
-                        end=end, frame_stride=int(cfg["frame_stride"]))
+    est, sched = replay(cfg["bag"], get, setup, cfg=est_cfg, on_keyframe=on_kf, start=cfg["start"],
+                        end=cfg["end"], frame_stride=int(cfg["frame_stride"]))
     print(f"replay: {len(b.stamps)} keyframes, final state {est.state.value}, "
           f"{est.n_tag_factors} tag factors, {est.n_recoveries} backend recoveries")
     if not cfg["batch"]["enabled"]:
@@ -399,7 +398,7 @@ def run_batch(cfg: Dict[str, Any], setup, get, shift: float) -> Batch:
         for tg in est.tag_index.tags():
             key = est.tag_index.key(tg)
             if result.exists(key):
-                b.T_lm[f"{tg[0]}:{tg[1]}"] = b.S_lm.compose(result.atPose3(key))
+                b.T_lm[tag_key_str(tg)] = b.S_lm.compose(result.atPose3(key))
     print(f"batch LM: {b.stats['n_factors']} factors, {b.stats['iterations']} iterations in "
           f"{b.stats['seconds']:.1f} s, error {b.stats['error_init']:.1f} -> "
           f"{b.stats['error_lm']:.1f}")
@@ -418,7 +417,7 @@ class Series:
     S_rt: List[Optional[gtsam.Pose3]]
     tag: np.ndarray                  # keyframe with tag factors (live record, else replay)
     tracking: np.ndarray
-    seeded: np.ndarray
+    init_jump: np.ndarray
     upd_live: np.ndarray             # ms
     upd_replay: np.ndarray           # ms
     X_rp: List[Optional[gtsam.Pose3]] = field(default_factory=list)  # replay's real-time X_k
@@ -453,8 +452,8 @@ def align(rec: Recorded, b: Batch, t0: float, view_start: Optional[float],
         tag=np.array([bool(j["accepted"]) if j else b.accepted[k] for j, k in zip(kfs, ks)]),
         tracking=np.array([j["state"] == "TRACKING" if j else b.tracking[k]
                            for j, k in zip(kfs, ks)]),
-        seeded=np.array([bool(j.get("seeded_from_tag")) if j else b.seeded[k]
-                         for j, k in zip(kfs, ks)]),
+        init_jump=np.array([is_init_jump(j) if j else b.init_jump[k]
+                            for j, k in zip(kfs, ks)]),
         upd_live=np.array([float(j["update_ms"]) if j else np.nan for j in kfs]),
         upd_replay=np.array([b.update_ms[k] for k in ks]),
         X_rp=[b.X_replay[k] for k in ks],
@@ -515,17 +514,6 @@ def _tag_clouds(s: Series, b: Batch, which: str) -> Dict[Any, np.ndarray]:
         if k in idx and track[idx[k]] is not None:
             pts.setdefault(tag, []).append(track[idx[k]].compose(T_bt).translation())
     return {tag: np.array(v).reshape(-1, 3) for tag, v in sorted(pts.items())}
-
-
-def _spread(q: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    """Centre, RMS and max horizontal distance (m) of a tag cloud around its own mean.
-
-    The tag is fixed, so ideally every observation lands on one point; the
-    cloud's own mean is the centre, so all clouds are measured the same way.
-    """
-    c = q[:, :2].mean(axis=0)
-    r = np.linalg.norm(q[:, :2] - c, axis=1)
-    return c, float(np.sqrt(np.mean(r ** 2))), float(r.max())
 
 
 def _planes(cfg: Dict[str, Any]) -> List[Tuple[str, int, int]]:
@@ -609,10 +597,11 @@ def _draw_tracks(ax, s: Series, b: Batch, setup, i: int, j: int, windows: List[d
                    edgecolors="black", linewidths=0.6, zorder=8,
                    label=f"tag factors from {', '.join(cams)} (attached, "
                          f"{int(s.attached.sum())} keyframes)")
-    if s.seeded.any():
-        ax.scatter(X[s.seeded, i], X[s.seeded, j], s=60, marker="D", facecolors="none",
+    if s.init_jump.any():
+        ax.scatter(X[s.init_jump, i], X[s.init_jump, j], s=60, marker="D", facecolors="none",
                    edgecolors="magenta", linewidths=1.6, zorder=8,
-                   label=f"tag back after a gap: X_k seeded from the tag ({s.seeded.sum()})")
+                   label=f"tag back after a gap: X_k initial value jumped "
+                         f"({s.init_jump.sum()})")
 
     # Station: S with its x axis, and the observed tags (live S with the URDF
     # tag pose; LM S with the LM tag pose), in the colour of their track.
@@ -675,7 +664,7 @@ def plot_overview(cfg: Dict[str, Any], s: Series, b: Batch, setup, png: str, tit
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     _style()
-    from matplotlib.patches import Circle, Rectangle
+    from matplotlib.patches import Circle
 
     E, X, L, R = _xyz(s.E), _xyz(s.X_rt), _xyz(s.X_lm), _xyz(s.X_rp)
     has_lm = bool(b.X_lm)
@@ -711,7 +700,7 @@ def plot_overview(cfg: Dict[str, Any], s: Series, b: Batch, setup, png: str, tit
         for tag, q in _tag_clouds(s, b, which).items():
             if len(q) < 3:
                 continue
-            c, rms, rmax = _spread(q)
+            c, rms, rmax = cloud_spread(q)
             ax.scatter(q[:, 0], q[:, 1], s=10, c=col, alpha=0.35 if which == "E" else 0.6,
                        linewidths=0, zorder=6)
             ax.add_patch(Circle(c, rms, facecolor=col, edgecolor=col, alpha=0.15, lw=1.2,
@@ -719,7 +708,7 @@ def plot_overview(cfg: Dict[str, Any], s: Series, b: Batch, setup, png: str, tit
             ax.add_patch(Circle(c, rmax, fill=False, edgecolor=col, alpha=0.8, lw=1.2, ls="--",
                                 zorder=4))
             per_tag.append(f"{tag[1]} {rms * 100:.1f}")
-            lines.append(f"tag {tag[0]}:{tag[1]} ({'+'.join(sorted(cams[tag]))}) via {name}: "
+            lines.append(f"tag {tag_key_str(tag)} ({'+'.join(sorted(cams[tag]))}) via {name}: "
                          f"{len(q)} obs, horizontal spread RMS {rms * 100:.1f} cm, "
                          f"max {rmax * 100:.1f} cm")
         if per_tag:
@@ -732,16 +721,8 @@ def plot_overview(cfg: Dict[str, Any], s: Series, b: Batch, setup, png: str, tit
         if not m.any():
             print(f"warning: no keyframes in window {w['label']} ({w['from']}-{w['to']} s)")
             continue
-        pts = np.vstack([X[m, :2], E[m, :2]])
-        lo, hi = pts.min(axis=0), pts.max(axis=0)
-        size = np.maximum(hi - lo + 0.24, 0.35)          # never smaller than 35 cm
-        c = 0.5 * (lo + hi)
-        ax.add_patch(Rectangle(c - size / 2, size[0], size[1], fill=False, ec="#1a202c", lw=1.4,
-                               zorder=7))
-        ax.text(c[0] - size[0] / 2, c[1] + size[1] / 2 + 0.04,
-                f"{w['label']}: {w['from']:g}–{w['to']:g} s", fontsize=12, fontweight="bold",
-                va="bottom", zorder=10,
-                bbox=dict(facecolor="white", edgecolor="none", alpha=0.85, pad=1.5))
+        window_box(ax, X[m], E[m], f"{w['label']}: {w['from']:g}–{w['to']:g} s", fontsize=12,
+                   zorder=7)
     ax.set_xlabel("odom x (m)")
     ax.set_ylabel("odom y (m)")
     ax.set_title("bird's-eye view (x–y)")
@@ -774,7 +755,7 @@ def plot_overview(cfg: Dict[str, Any], s: Series, b: Batch, setup, png: str, tit
     # ------------------------------------------------------------ time panels
     def frame(t_ax, ylabel: str) -> None:
         _shade_dvl(t_ax, s.dvl_gaps, legend=t_ax is tx[0])
-        _shade_windows(t_ax, cfg["windows"], None)
+        _shade_windows(t_ax, cfg["windows"])
         t_ax.set_ylabel(ylabel)
         t_ax.grid(alpha=0.3, which="both")
         # Legend in one row above the panel, clear of the data and the labels.
@@ -825,18 +806,15 @@ def plot_overview(cfg: Dict[str, Any], s: Series, b: Batch, setup, png: str, tit
     if timing:
         cx = tx[2]
 
-        def st(u: np.ndarray) -> str:
-            u = u[np.isfinite(u)]
-            return (f"median {np.median(u):.1f}, p95 {np.percentile(u, 95):.1f}, "
-                    f"max {u.max():.1f} ms")
+        st = timing_stats
         cx.plot(s.t, s.upd_live, c="#4a5568", lw=0.9,
                 label=f"{cfg['timing']['live_label']}, live ({st(s.upd_live)})")
         lines.append(f"update time, live: {st(s.upd_live)}")
         lo = np.nanmin(s.upd_live)
         if cfg["timing"]["replay"]:
             cx.plot(s.t, s.upd_replay, c=C_RT, lw=0.9,
-                    label=f"replay on {_cpu_name()} ({st(s.upd_replay)})")
-            lines.append(f"update time, replay on {_cpu_name()}: {st(s.upd_replay)}")
+                    label=f"replay on {cpu_name()} ({st(s.upd_replay)})")
+            lines.append(f"update time, replay on {cpu_name()}: {st(s.upd_replay)}")
             lo = min(lo, np.nanmin(s.upd_replay))
         budget = 1000.0 * float(np.median(np.diff(s.t))) if len(s.t) > 1 else 200.0
         cx.axhline(budget, c="#c53030", lw=1.4, ls="--",
@@ -905,15 +883,15 @@ def plot_rt_vs_batch(cfg: Dict[str, Any], s: Series, b: Batch, png: str, title: 
         x.vlines(s.t[s.tag_rp if s.show_rp else s.tag], top * 0.95, top, color=C_TICK, lw=0.8)
         if s.attached.any():
             x.vlines(s.t[s.attached], top * 0.91, top * 0.945, color=C_ATT, lw=0.8)
-        for t in s.t[s.seeded]:
+        for t in s.t[s.init_jump]:
             x.axvline(t, color="magenta", ls=":", lw=0.8)
         _shade_dvl(x, s.dvl_gaps, legend=x is ax)
-        _shade_windows(x, cfg["windows"], None)
+        _shade_windows(x, cfg["windows"])
         x.grid(alpha=0.3)
         x.legend(fontsize=11, loc="upper left")
     ax.set_xlim(s.t[0], s.t[-1])
     fig.suptitle(title + "\nyellow ticks: keyframes with tag factors; sky blue: from an attached "
-                 "camera; magenta: X_k seeded from the tag", fontsize=11)
+                 "camera; magenta: X_k initial value jumped (tag back after a gap)", fontsize=11)
     fig.tight_layout()
     fig.savefig(png, dpi=cfg["dpi"], bbox_inches="tight")
     plt.close(fig)
@@ -930,21 +908,10 @@ def _shade_dvl(ax, gaps: List[Tuple[float, float]], legend: bool = False) -> Non
                    label="DVL bottom lock lost" if legend and i == 0 else None)
 
 
-def _shade_windows(ax, windows: List[dict], label_y: Optional[float]) -> None:
+def _shade_windows(ax, windows: List[dict]) -> None:
+    """Grey band over each zoom window on a time axis."""
     for w in windows:
         ax.axvspan(w["from"], w["to"], color="#1a202c", alpha=0.18, lw=0)
-        if label_y is not None:
-            ax.text(0.5 * (w["from"] + w["to"]), label_y, w["label"], ha="center", fontsize=10,
-                    fontweight="bold")
-
-
-def _cpu_name() -> str:
-    import platform
-    try:
-        with open("/proc/cpuinfo", encoding="utf-8") as f:
-            return next(ln.split(":", 1)[1].strip() for ln in f if ln.startswith("model name"))
-    except (OSError, StopIteration):
-        return platform.processor() or platform.machine()
 
 
 # ---------------------------------------------------------------------------- outputs
@@ -1027,17 +994,16 @@ def main(argv: List[str] = None) -> None:
 
     get = getter_from_yaml(cfg["dock_fuser_config"])
     setup = build_setup(get, lambda m: print("warning:", m))
-    print("tags: " + ", ".join(f"{f}:{i} ({t.size * 100:g} cm)"
-                               for (f, i), t in setup.tags.items()))
+    print("tags: " + ", ".join(f"{tag_key_str(key)} ({t.size * 100:g} cm)"
+                               for key, t in setup.tags.items()))
     t0 = source_start_time(cfg["bag"])              # zero of every time axis
-    shift = bag_start_time(cfg["bag"]) - t0
 
     topics = dict(cfg["topics"])
     if topics["dvl"] is None:
         topics["dvl"] = get("dvl_topic") or ""
     rec = read_recorded(cfg["bag"], topics)
     gaps = dvl_gaps(rec.dvl, float(get("estimator.dvl_timeout")), t0)
-    b = run_batch(cfg, setup, get, shift)
+    b = run_batch(cfg, setup, get)
     s = align(rec, b, t0, cfg["view_start"], cfg["view_end"], gaps, cfg["replay_track"])
 
     name = cfg["title"] or bag_source(cfg["bag"])

@@ -2,9 +2,9 @@
 
 Usage::
 
-    ros2 run race_auv_factorgraph batch_lm BAG --config tank_dock_fuser.yaml [--csv out.csv]
+    ros2 run race_auv_factorgraph batch_lm BAG --config tank_factorgraph.yaml [--csv out.csv]
 
-The real-time estimator (iSAM2) publishes each ``X_k`` as known *at keyframe
+The real-time estimator (fixed-lag smoother) publishes each ``X_k`` as known *at keyframe
 k*: a filtering estimate that only uses measurements up to that moment. A
 post-processing solve re-optimizes the whole trajectory at once, so every
 ``X_k`` also benefits from tag observations made *after* it (smoothing),
@@ -168,7 +168,7 @@ def main(argv: List[str] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("bag", help="bag with EKF odometry and the corner-detection topics")
     ap.add_argument("--config", required=True, nargs="+",
-                    help="dock_fuser parameter file(s) used for the run, merged in order")
+                    help="node parameter file(s) used for the run, merged in order")
     ap.add_argument("--csv", default="", help="optional per-keyframe output")
     ap.add_argument("--max-iterations", type=int, default=100)
     args = ap.parse_args(argv)

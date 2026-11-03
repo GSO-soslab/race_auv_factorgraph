@@ -2,9 +2,9 @@
 
 The rule
 --------
-``apriltag_detector_node`` runs on a fixed timer (``publish_rate``, 5 Hz on
-the vehicle). Every tick it detects on the newest image and publishes the
-result, *including when no tag was found*. Each such message becomes one
+The tag detector (``tag_detector_node``) runs on a fixed timer
+(``publish_rate``, 5 Hz on the vehicle). Every tick it detects on the newest
+image and publishes the result, *including when no tag was found*. Each such message becomes one
 keyframe ``X_k``, stamped with the message's ``header.stamp``, which is the
 image capture time. The detector's timer is therefore the graph's clock:
 

@@ -7,7 +7,7 @@ import numpy as np
 from race_auv_factorgraph.core.common.config import config_from_dict
 from race_auv_factorgraph.core.factors.projection import project_tag
 from race_auv_factorgraph.core.common.geometry import (gtsam_cov_to_ros, pose_distance,
-                                                pose_from_xyz_rpy, quat_xyzw, step_towards)
+                                                pose_from_xyz_rpy, quat_xyzw)
 from race_auv_factorgraph.core.common.model import Detection, TagFrame, normalize_family
 from race_auv_factorgraph.core.frontend.pnp import ippe_tag
 from race_auv_factorgraph.core.frontend.pose_buffer import PoseBuffer
@@ -42,14 +42,6 @@ def test_quaternion_roundtrip():
     x, y, z, w = quat_xyzw(p)
     q = gtsam.Rot3.Quaternion(w, x, y, z)
     assert p.rotation().equals(q, 1e-9)
-
-
-def test_step_towards_limits():
-    a = gtsam.Pose3()
-    b = pose_from_xyz_rpy([1.0, 0, 0], [0, 0, 0.5])
-    c = step_towards(a, b, max_trans=0.1, max_rot=1.0)
-    assert abs(pose_distance(a, c)[0] - 0.1) < 1e-9
-    assert step_towards(a, b, 10.0, 10.0).equals(b, 1e-12)
 
 
 def test_cov_to_ros_reorders_blocks():
@@ -140,7 +132,7 @@ def test_scheduler_drops_oldest_when_ekf_stalls():
     assert [round(k.stamp, 3) for k in s.poll()] == [0.6, 0.8, 1.0]   # the newest three
 
 
-# ----------------------------------------------------------------------- PnP + gates
+# ----------------------------------------------------------------------- PnP
 def _observe(X, S, cam, tag, noise=0.0, seed=0):
     uv, _ = project_tag(X, S, tag.T_dock_tag, cam, tag)
     return uv + np.random.default_rng(seed).normal(0, noise, uv.shape)
@@ -158,12 +150,6 @@ def test_ippe_recovers_true_pose():
 
 # The per-image checks (border, minimum side, PnP fit) moved to the tag
 # detector: race_auv_camera_tag_factorgraph/test/test_tags.py.
-
-
-def test_detection_min_side():
-    """Shortest side of the corner quad (sets the seed's PnP range tolerance)."""
-    d = Detection("cam_front", ("36h11", 146), np.array([[0, 0], [40, 0], [40, 30], [0, 30.]]))
-    assert abs(d.min_side_px() - 30.0) < 1e-12
 
 
 def _getter(**over):
@@ -251,61 +237,92 @@ def test_attached_frame_rejected_before_tracking():
     assert [a.stamp for a in est.process_keyframe(0.4, gtsam.Pose3()).attached] == [0.25]
 
 
+# ----------------------------------------------------------------------- initial value of X_k
+def test_drift_covariance_accumulates_odometry_steps():
+    """The prior of _init_from_tags: step variances add up while no tag is seen, and
+    moving forward turns yaw uncertainty into lateral uncertainty (the adjoint)."""
+    from race_auv_factorgraph.core.backend.estimator import DockEstimator
+    from race_auv_factorgraph.core.common.config import EstimatorConfig
+    from race_auv_factorgraph.core.factors.odometry import odometry_step_sigmas
+    cfg = EstimatorConfig()
+    # Standing still: P is the sum of the 5 steps' variances.
+    est = DockEstimator(cfg, default_cameras(), default_tags())
+    for i in range(6):
+        est.process_keyframe(0.2 * i, gtsam.Pose3())
+    sig = odometry_step_sigmas(gtsam.Pose3(), gtsam.Pose3(), 0.2, cfg)
+    np.testing.assert_allclose(est._drift_cov, 5 * np.diag(sig ** 2), rtol=1e-9)
+    # Driving 0.5 m per step along body x: the yaw (pitch) noise of each step
+    # swings the position sideways (up) over the distance still to go, 2.0, 1.5,
+    # 1.0, 0.5 and 0 m; along the track (x) only the steps' own noise adds up.
+    est = DockEstimator(cfg, default_cameras(), default_tags())
+    for i in range(6):
+        est.process_keyframe(0.2 * i, gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.5 * i, 0, 0)))
+    P = est._drift_cov
+    sig = odometry_step_sigmas(gtsam.Pose3(), gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.5, 0, 0)),
+                               0.2, cfg)
+    lever = sig[2] ** 2 * (2.0 ** 2 + 1.5 ** 2 + 1.0 ** 2 + 0.5 ** 2)
+    np.testing.assert_allclose(P[3, 3], 5 * sig[3] ** 2, rtol=1e-9)
+    np.testing.assert_allclose([P[4, 4], P[5, 5]], 5 * sig[3] ** 2 + lever, rtol=1e-6)
+
+
 # ----------------------------------------------------------------------- node outputs
-def test_compat_pose_is_docking_pose_moved_by_ekf_motion():
-    """The detection-style pose is X_k^-1 S at t_k, moved by the EKF's relative motion after it,
-    so an EKF snap (DVL re-lock: the whole EKF track shifts) leaves it unchanged."""
+def _node_module():
+    """ros/node.py, or skip when ROS (rclpy, race_auv_msgs) is not available."""
     import pytest
     pytest.importorskip("rclpy")
+    pytest.importorskip("race_auv_msgs")
+    from race_auv_factorgraph.ros import node
+    return node
+
+
+def test_auv_pose_at_is_keyframe_pose_moved_by_ekf_motion():
+    """pose(t) = X_k (E_k^-1 E(t)); X_k itself when the EKF's motion is not trusted (DVL)."""
     from race_auv_factorgraph.core.backend.estimator import KeyframeResult
     from race_auv_factorgraph.core.init.state_machine import StationState
-    from race_auv_factorgraph.ros.node import compat_dock_pose, corrected_frame_transform
-    X = pose_from_xyz_rpy([-1.5, 0.3, 0.4], [0.01, 0.02, 0.2])
-    E = pose_from_xyz_rpy([-1.2, 0.1, 0.38], [0.012, 0.018, 0.15])   # drifted EKF
-    S = pose_from_xyz_rpy([0.1, -0.05, 0.0], [0.0, 0.0, 0.3])
-    res = KeyframeResult(k=7, stamp=1.0, state=StationState.TRACKING, X=X, E=E, S=S)
-    assert compat_dock_pose(E, E, res.dock_in_base).equals(res.dock_in_base, 1e-9)
-    # 0.1 s later the AUV moved forward 3 cm (in its own frame): the dock is 3 cm closer.
-    step = pose_from_xyz_rpy([0.03, 0.0, 0.0], [0.0, 0.0, 0.0])
-    moved = compat_dock_pose(E, E.compose(step), res.dock_in_base)
-    assert moved.equals(step.inverse().compose(res.dock_in_base), 1e-9)
-    # An EKF snap shifts E_k and E(t) alike: the result does not change.
+    X = pose_from_xyz_rpy([-1.5, 0.3, 0.4], [0.01, 0.02, 0.2])        # graph frame
+    E = pose_from_xyz_rpy([-1.2, 0.1, 0.38], [0.012, 0.018, 0.15])    # drifted EKF, odom
+    kf = KeyframeResult(k=7, stamp=1.0, state=StationState.TRACKING, X=X, E=E)
+    step = pose_from_xyz_rpy([0.03, 0.0, 0.0], [0.0, 0.0, 0.01])      # AUV motion after k
+
+    # At the keyframe stamp: the graph's pose.
+    assert kf.auv_pose_at(E).equals(X, 1e-9)
+    # Later: the same motion, from the graph's pose; i.e. the correction X E^-1 applied to E(t).
+    pose = kf.auv_pose_at(E.compose(step))
+    assert pose.equals(X.compose(step), 1e-9)
+    assert pose.equals(kf.drift_correction.compose(E.compose(step)), 1e-9)
+    # EKF snap (DVL re-lock, 1.65 m): its motion is not trusted, the pose stays X_k.
     snap = pose_from_xyz_rpy([1.65, -0.3, 0.0], [0.0, 0.0, 0.02])
-    assert compat_dock_pose(snap.compose(E), snap.compose(E.compose(step)),
-                            res.dock_in_base).equals(moved, 1e-9)
-    # In the corrected frame, base_link (at E in odom) lands on the graph's X_k.
-    assert corrected_frame_transform(res).inverse().compose(E).equals(X, 1e-9)
+    assert kf.auv_pose_at(snap.compose(E), ekf_trusted=False).equals(X, 1e-12)
 
 
-def test_station_tf_limiter_passes_ekf_snaps_and_limits_graph_corrections():
-    """TF odom -> station: base_link -> station is rate-limited, an EKF snap is not."""
-    import pytest
-    pytest.importorskip("rclpy")
-    from race_auv_factorgraph.ros.node import StationTfLimiter
-    rel = pose_from_xyz_rpy([1.5, -0.2, -0.3], [0.0, 0.0, 0.1])     # base_link -> station
-    E0 = pose_from_xyz_rpy([2.0, 1.0, -3.0], [0.0, 0.0, 0.5])
-    lim = StationTfLimiter(max_trans_rate=0.5, max_rot_rate=0.5)
-    lim.set_target(E0, rel, jump=True)
-    # Steady state: odom -> station = E_k * rel_k, so base_link -> station = rel_k.
-    assert E0.inverse().compose(lim.update(0.0, E0)).equals(rel, 1e-9)
-    # EKF snap of 1.65 m between two messages (DVL re-lock: not reliable), AUV not moving:
-    # base_link -> station must not move at all, the odom edge takes the whole snap.
-    snap = pose_from_xyz_rpy([1.65, -0.3, 0.0], [0.0, 0.0, 0.02])
-    E1 = snap.compose(E0)
-    lim.set_target(E1, rel)                       # the graph: relative pose unchanged
-    assert E1.inverse().compose(lim.update(0.05, E1, ekf_reliable=False)).equals(rel, 1e-9)
-    # A graph correction (tag back after a gap: target 1 m away) moves at <= 0.5 m/s.
-    rel2 = pose_from_xyz_rpy([2.5, -0.2, -0.3], [0.0, 0.0, 0.1])
-    lim.set_target(E1, rel2)
-    out = [E1.inverse().compose(lim.update(0.05 + 0.05 * i, E1)) for i in range(1, 5)]
-    steps = [pose_distance(a, b)[0] for a, b in zip([rel] + out, out)]
-    assert max(steps) <= 0.5 * 0.05 + 1e-9 and pose_distance(out[-1], rel)[0] > 0.09
-    # The AUV moving under a steady estimate: base_link -> station follows the motion exactly.
-    lim.set_target(E1, rel, jump=True)
-    lim.update(1.0, E1)
-    fwd = pose_from_xyz_rpy([0.02, 0.0, 0.0], [0.0, 0.0, 0.0])
-    E2 = E1.compose(fwd)
-    assert E2.inverse().compose(lim.update(1.05, E2)).equals(fwd.inverse().compose(rel), 1e-9)
+def test_dock_pose_covariance_along_odom_graph_axes():
+    """The docking-pose covariance (local, gtsam [rot, trans]) rotated by S, in ROS [trans, rot]."""
+    node = _node_module()
+    from race_auv_factorgraph.core.backend.estimator import KeyframeResult
+    from race_auv_factorgraph.core.init.state_machine import StationState
+    S = pose_from_xyz_rpy([2.0, -1.0, 0.5], [0.0, 0.0, np.pi / 2])    # dock yawed 90 deg
+    res = KeyframeResult(k=3, stamp=1.0, state=StationState.TRACKING, X=gtsam.Pose3(),
+                         E=gtsam.Pose3(), S=S, dock_cov=np.diag([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+    msg = node.dock_pose_with_covariance(res)
+    assert (msg.pose.position.x, msg.pose.position.y, msg.pose.position.z) == (2.0, -1.0, 0.5)
+    cov = np.array(msg.covariance).reshape(6, 6)
+    # Dock-frame x (variance 4) lies along odom_graph y after the 90 deg yaw, and vice versa.
+    np.testing.assert_allclose(np.diag(cov), [5.0, 4.0, 6.0, 2.0, 1.0, 3.0], atol=1e-9)
+
+
+def test_params_file_sections(tmp_path):
+    """The node's section under any ROS 2 name form, '/**' first, and the former dock_fuser name."""
+    from race_auv_factorgraph.ros.params import flatten_params_yaml
+    new = tmp_path / "new.yaml"
+    new.write_text("/**:\n  ros__parameters: {tag_ids: [1], odom_topic: shared}\n"
+                   "/**/race_auv_factorgraph:\n  ros__parameters: {odom_topic: mine, "
+                   "estimator: {sigma_px: 2.0}}\n"
+                   "/**/other_node:\n  ros__parameters: {odom_topic: theirs}\n")
+    flat = flatten_params_yaml(str(new))
+    assert flat == {"tag_ids": [1], "odom_topic": "mine", "estimator.sigma_px": 2.0}
+    old = tmp_path / "old.yaml"
+    old.write_text("dock_fuser:\n  ros__parameters: {odom_topic: legacy}\n")
+    assert flatten_params_yaml(str(old)) == {"odom_topic": "legacy"}
 
 
 # ----------------------------------------------------------------------- DVL monitor

@@ -9,9 +9,9 @@
 * ``NO_STATION``: no tag seen yet. The graph holds only the ``X`` chain and
   tracks the EKF.
 * ``CANDIDATE``: tag frames are buffered (not dropped) and, after each new
-  frame, voting + batch solve are attempted (:func:`init.try_initialize`).
+  frame, voting + batch solve are attempted (:func:`solver.try_initialize`).
 * ``TRACKING``: ``S`` and the ``T_j`` exist in the graph. Tag observations
-  go through gates 3 (and 4) and become projection factors directly.
+  become projection factors directly.
 
 The window slides two ways: frames older than ``init_window_duration`` are
 dropped, and so are the oldest frames beyond ``init_window_max_frames``. A
@@ -44,12 +44,10 @@ class StationInitializer:
         self.cfg = cfg
         self.state = StationState.NO_STATION
         self.frames: List[BufferedFrame] = []
-        self.last_reason = ""
 
     def reset(self) -> None:
         self.state = StationState.NO_STATION
         self.frames.clear()
-        self.last_reason = ""
 
     def _slide(self, now: float) -> None:
         """Drop frames that fell out of the time window or the frame budget."""
@@ -77,7 +75,6 @@ class StationInitializer:
 
         usable = [f for f in self.frames if f.hypotheses]
         decision = try_initialize(usable, X_est, cams, tags, self.cfg)
-        self.last_reason = decision.reason
         if decision.accepted:
             self.state = StationState.TRACKING
         elif decision.reason.startswith(("batch", "ambiguous")):
@@ -87,6 +84,3 @@ class StationInitializer:
         if not self.frames and self.state == StationState.CANDIDATE:
             self.state = StationState.NO_STATION
         return decision
-
-    def buffered_keyframes(self) -> List[int]:
-        return [f.k for f in self.frames]

@@ -1,4 +1,4 @@
-"""Re-run tag detection + dock_fuser on a recorded bag window, and record the results.
+"""Re-run tag detection + race_auv_factorgraph on a recorded bag window, and record the results.
 
 Usage::
 
@@ -17,7 +17,7 @@ What runs
 2. ``tag_detector_node`` (``race_auv_camera_tag_factorgraph``, namespace
    ``cam_front``) on the recorded front-camera images: rectify, tag36h11,
    image checks, then the 4-corner ``apriltag_detection/tags``.
-3. ``dock_fuser`` with the tank config (debug topics on).
+3. ``race_auv_factorgraph`` with the tank config (analysis topics on).
 4. ``ros2 bag play`` of the window ``[start_offset, start_offset + duration]``
    seconds from the start of the bag, with ``--clock``. Only the camera
    images, the recorded EKF odometry and the DVL velocity are replayed: the old detector
@@ -25,7 +25,7 @@ What runs
 
 Everything uses simulated time from the bag's ``/clock``, so stamps in the
 output bag match the original recording. When playback ends, the launch
-waits ``shutdown_delay`` seconds (letting the detector and the fuser finish
+waits ``shutdown_delay`` seconds (letting the detector and the graph finish
 their last frames) and then shuts everything down. Stopping the recorder
 with SIGINT closes the output bag cleanly.
 
@@ -36,7 +36,7 @@ i.e. every 3rd image of the 15 Hz camera, as on the vehicle.
 Detection-only pass (for comparing backends offline with ``compare_backends``)::
 
     ros2 launch race_auv_factorgraph bag_test.launch.py bag:=<bag> start_offset:=0 \
-        duration:=100000 run_fuser:=false record_images:=false
+        duration:=100000 run_graph:=false record_images:=false
 
 records just the corner detections and the EKF. Every backend can then be
 replayed on exactly the same detections.
@@ -69,10 +69,12 @@ RECORD_TOPICS = [
     "/cam_front/apriltag_detection/detections3d",
     "/cam_front/apriltag_detection/camera_info",
     "/cam_front/apriltag_detection/image/compressed",
-    "/race_auv/dock_point/pose",
-    "/dock_fuser/auv_pose",
-    "/dock_fuser/station_pose",
-    "/dock_fuser/keyframe",
+    # race_auv_factorgraph (namespace race_auv)
+    "/race_auv/race_auv_factorgraph/odometry",
+    "/race_auv/race_auv_factorgraph/dock_state",
+    "/race_auv/race_auv_factorgraph/dock_pose",
+    "/race_auv/race_auv_factorgraph/auv_pose",
+    "/race_auv/race_auv_factorgraph/keyframe",
     "/diagnostics",
     "/tf",
     "/tf_static",
@@ -100,10 +102,10 @@ def _setup(context, *args, **kwargs):
         f"{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
-    run_fuser = lc("run_fuser").lower() in ("1", "true", "yes")
+    run_graph = lc("run_graph").lower() in ("1", "true", "yes")
     topics = [t for t in RECORD_TOPICS
               if (lc("record_images").lower() in ("1", "true", "yes") or not t.endswith("/image/compressed"))
-              and (run_fuser or not (t.startswith("/dock_fuser") or "dock_point" in t))]
+              and (run_graph or "/race_auv_factorgraph/" not in t)]
     record = ExecuteProcess(
         cmd=["ros2", "bag", "record", "--use-sim-time", "-s", "mcap", "-o", out, *topics],
         output="screen", sigterm_timeout="10")
@@ -113,10 +115,10 @@ def _setup(context, *args, **kwargs):
         namespace="cam_front", name="tag_detector", output="screen",
         parameters=[lc("detector_config"), {"use_sim_time": True}])
 
-    fuser = Node(
-        package="race_auv_factorgraph", executable="dock_fuser_node",
-        name="dock_fuser", output="screen",
-        parameters=[lc("fuser_config"), {"use_sim_time": True}])
+    graph = Node(
+        package="race_auv_factorgraph", executable="factorgraph_node",
+        namespace="race_auv", name="race_auv_factorgraph", output="screen",
+        parameters=[lc("graph_config"), {"use_sim_time": True}])
 
     play = ExecuteProcess(
         cmd=["ros2", "bag", "play", bag, "--clock", "100",
@@ -127,7 +129,7 @@ def _setup(context, *args, **kwargs):
         output="screen")
 
     return [
-        record, detector, *([fuser] if run_fuser else []),
+        record, detector, *([graph] if run_graph else []),
         # Give the recorder and the nodes time to start and discover each
         # other before the first message is played.
         TimerAction(period=float(lc("startup_delay")), actions=[play]),
@@ -155,10 +157,10 @@ def generate_launch_description():
                               description="output bag (default ~/ros2bag/dock_fuser_tests/...)"),
         DeclareLaunchArgument("detector_config",
                               default_value=os.path.join(share, "config", "tank_tag_detector.yaml")),
-        DeclareLaunchArgument("fuser_config",
-                              default_value=os.path.join(share, "config", "tank_dock_fuser.yaml")),
-        DeclareLaunchArgument("run_fuser", default_value="true",
-                              description="false: detection-only pass (no dock_fuser)"),
+        DeclareLaunchArgument("graph_config",
+                              default_value=os.path.join(share, "config", "tank_factorgraph.yaml")),
+        DeclareLaunchArgument("run_graph", default_value="true",
+                              description="false: detection-only pass (no factor graph)"),
         DeclareLaunchArgument("record_images", default_value="true",
                               description="record the annotated detector image (large; "
                                           "needs publish_image: true in the detector config)"),

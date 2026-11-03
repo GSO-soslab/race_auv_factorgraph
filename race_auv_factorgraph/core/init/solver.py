@@ -46,8 +46,8 @@ from ..common.config import EstimatorConfig
 from ..common.geometry import pose_distance
 from ..common.model import CameraModel, Detection, TagKey, TagModel
 from ..factors.odometry import odometry_factor
-from ..factors.priors import pose_prior
-from ..factors.projection import TagProjectionFactor
+from ..factors.priors import pose_prior, tag_mount_prior
+from ..factors.projection import TagProjectionFactor, tag_projection_factor
 from ..frontend.pnp import station_solutions
 
 
@@ -85,8 +85,8 @@ class BufferedFrame:
 
     ``k`` is the frame's keyframe index; its ``X_k`` already exists in the
     backend. ``E`` is the EKF pose at the frame (for the batch-solve
-    odometry factors). ``detections`` already passed
-    gates 1 and 2.
+    odometry factors). ``detections`` are the frame's usable ones (station
+    tag, PnP succeeded).
     """
 
     k: int
@@ -287,15 +287,13 @@ def batch_solve(frames: List[BufferedFrame], S0: gtsam.Pose3,
     values.insert(K.S, S0)
     tag_index = K.TagIndex()
     proj: List[TagProjectionFactor] = []
-    mount_rot = math.radians(cfg.sigma_mount_rot_deg)
     for f in frames:
         for d in f.detections:
             tkey = tag_index.key(d.tag)
             if not values.exists(tkey):
                 values.insert(tkey, tags[d.tag].T_dock_tag)
-                graph.add(pose_prior(tkey, tags[d.tag].T_dock_tag, mount_rot, cfg.sigma_mount_trans))
-            pf = TagProjectionFactor(K.X(f.k), K.S, tkey, cams[f.camera], tags[d.tag], d.corners,
-                                     cfg.sigma_px, cfg.tag_huber_k, cfg.min_projection_depth)
+                graph.add(tag_mount_prior(tkey, tags[d.tag], cfg))
+            pf = tag_projection_factor(K.X(f.k), tkey, cams[f.camera], tags[d.tag], d.corners, cfg)
             proj.append(pf)
             graph.add(pf.factor)
 

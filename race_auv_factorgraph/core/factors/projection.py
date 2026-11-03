@@ -26,6 +26,8 @@ from typing import List, Optional, Tuple
 import gtsam
 import numpy as np
 
+from ..common import keys as K
+from ..common.config import EstimatorConfig
 from ..common.geometry import jac_buffer as _F
 from ..common.model import CameraModel, TagModel
 from .noise import huber
@@ -45,8 +47,8 @@ def project_tag(X: gtsam.Pose3, S: gtsam.Pose3, T: gtsam.Pose3,
 
     Returns ``(uv, depth)``: ``(4, 2)`` predicted pixels and ``(4,)`` corner
     depths ``z`` in the camera frame. Depths <= 0 mean the corner is behind
-    the camera, and those pixels are meaningless. Used by the gates and by
-    evaluation; the factor below repeats the same chain with Jacobians.
+    the camera, and those pixels are meaningless. Used by the synthetic data
+    and by evaluation; the factor below repeats the same chain with Jacobians.
     """
     P = X.compose(cam.T_bc)
     W = S.compose(T)
@@ -91,7 +93,6 @@ class TagProjectionFactor:
         self.cam = cam
         self.tag = tag
         self.observed = np.asarray(corners, dtype=float).reshape(4, 2)
-        self.sigma_px = float(sigma_px)
         self.min_depth = float(min_depth)
         noise = huber(gtsam.noiseModel.Isotropic.Sigma(8, sigma_px), huber_k)
         # The CustomFactor keeps a reference to the bound method, so the
@@ -165,3 +166,15 @@ class TagProjectionFactor:
         """RMS corner error (px) at ``values``, without the robust kernel."""
         e = self._error(self.factor, values, None)
         return float(np.sqrt(np.mean(e.reshape(4, 2) ** 2) * 2.0))
+
+
+def tag_projection_factor(x_key: int, t_key: int, cam: CameraModel, tag: TagModel,
+                          corners: np.ndarray, cfg: EstimatorConfig) -> TagProjectionFactor:
+    """One detection's projection factor on ``(X, S, T_j)``, with the config's noise model.
+
+    ``sigma_px`` per corner coordinate, the ``tag_huber_k`` kernel and the
+    ``min_projection_depth`` clamp: the same for every projection factor in
+    the estimator, initialization and the initial-value solve.
+    """
+    return TagProjectionFactor(x_key, K.S, t_key, cam, tag, corners,
+                               cfg.sigma_px, cfg.tag_huber_k, cfg.min_projection_depth)

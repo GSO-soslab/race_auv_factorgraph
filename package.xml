@@ -4,9 +4,10 @@
   <name>race_auv_factorgraph</name>
   <version>0.1.0</version>
   <description>
-    gtsam iSAM2 factor graph (node: dock_fuser) that estimates the docking
-    station pose from AprilTag corner detections and the robot_localization
-    EKF odometry. Design: docs/DOCK_FUSER_PIPELINE.md.
+    gtsam factor graph (node: race_auv_factorgraph) that estimates the
+    docking station pose and the drift-corrected AUV pose from AprilTag corner
+    detections and the robot_localization EKF odometry.
+    ROS interface: docs/ROS_INTERFACE.md. Design: docs/DOCK_FUSER_PIPELINE.md.
     The gtsam Python bindings (>= 4.2, `import gtsam`) are not a rosdep key:
     install them with `pip install gtsam`.
   </description>
@@ -20,6 +21,7 @@
   <depend>diagnostic_msgs</depend>
   <depend>std_msgs</depend>
   <depend>apriltag_msgs</depend>
+  <depend>race_auv_msgs</depend>
   <depend>tf2_ros</depend>
 
   <exec_depend>ament_index_python</exec_depend>

@@ -1,21 +1,22 @@
-# dock_fuser parameters for the Stonefish simulation.
+# race_auv_factorgraph parameters for the Stonefish simulation
+# (launch/factorgraph.launch.py). ROS interface: docs/ROS_INTERFACE.md.
 # Design reference: docs/DOCK_FUSER_PIPELINE.md (section numbers in comments).
 # Every estimator.* knob and its default is documented in
 # race_auv_factorgraph/core/common/config.py; only overrides need to appear here.
-dock_fuser:
+/**/race_auv_factorgraph:
   ros__parameters:
     # ------------------------------------------------------------ inputs (§3)
     odom_topic: /race_auv/odometry/filtered     # robot_localization EKF (namespace race_auv)
 
     # ------------------------------------------------------------ frames (§10)
-    graph_frame: race_auv/odom                  # = the EKF's odom frame
+    odom_frame: race_auv/odom                   # the EKF's frame
+    odom_graph_frame: race_auv/odom_graph       # the graph's drift-corrected odom frame
     base_frame: race_auv/base_link
-    station_base_frame: race_station/base_link  # child of graph_frame in the TF tree
+    station_base_frame: race_station/base_link  # child of odom_graph in the TF tree
     dock_frame: race_station/dock_point
     # The station robot_state_publisher is not part of the AUV bringup, so
-    # publish base_link -> dock_point from the station URDF here.
-    publish_station_static_tf: true
-    dock_pose_topic: /race_auv/dock_point/pose
+    # publish station base_link -> dock_point and the tag frames here.
+    publish_station_frames: true
 
     # ------------------------------------------------------------ URDFs (§3)
     auv_urdf_package: race_auv_description
@@ -40,7 +41,7 @@ dock_fuser:
     # "Rectifier ready: ..." log line.
     # One camera: each of its detector messages (tags or not) is one keyframe,
     # so the detector's publish_rate (5 Hz on the Jetson) is the keyframe rate.
-    # cam_down's block below is kept for when multi-camera support returns.
+    # cam_down's block below is used when it is added to camera_names (attached camera).
     camera_names: [cam_front]
     cameras:
       cam_front:

@@ -33,6 +33,7 @@ import gtsam
 import numpy as np
 
 from ..common.config import EstimatorConfig
+from ..factors.priors import pose_prior, pose_prior_cov
 
 
 class Backend:
@@ -97,6 +98,14 @@ class Backend:
             return np.asarray(self._smoother.marginalCovariance(key))
         except RuntimeError:
             return None
+
+    def marginal_prior(self, key: int, value: gtsam.Pose3, sigma_rot: float,
+                       sigma_trans: float) -> gtsam.PriorFactorPose3:
+        """Prior on ``key`` at ``value`` with its marginal covariance here; these sigmas if unknown."""
+        cov = self.marginal_covariance(key)
+        if cov is not None and np.all(np.isfinite(cov)):
+            return pose_prior_cov(key, value, cov)
+        return pose_prior(key, value, sigma_rot, sigma_trans)
 
     def full_graph(self) -> gtsam.NonlinearFactorGraph:
         """Every factor added to this backend since it was created.

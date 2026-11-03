@@ -12,11 +12,11 @@ out_dir: ""                    # default: <bag>/analysis
 title: ""                      # default: the bag name
 
 # The parameter files the live node ran with, in launch order
-# (race_auv_bringup/launch/include/dock_fuser.launch.py). The batch graph is
+# (race_auv_bringup/launch/include/factorgraph.launch.py). The batch graph is
 # rebuilt with them, so they must match the live run.
 dock_fuser_config:
   - package://race_auv_bringup/config/station_tags.yaml
-  - package://race_auv_bringup/config/dock_fuser.yaml
+  - package://race_auv_bringup/config/race_auv_factorgraph.yaml
 
 # Merged on top of the files above. The live node ran with tag 54 only
 # ("dock_fuser ready: ... tags ['36h11:54']" in /rosout), while

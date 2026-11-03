@@ -35,10 +35,6 @@ class PoseBuffer:
     def newest_stamp(self) -> Optional[float]:
         return self._stamps[-1] if self._stamps else None
 
-    @property
-    def oldest_stamp(self) -> Optional[float]:
-        return self._stamps[0] if self._stamps else None
-
     def add(self, stamp: float, pose: gtsam.Pose3) -> None:
         """Insert a pose. Out-of-order inserts are kept sorted; exact duplicates replace."""
         stamp = float(stamp)
@@ -69,7 +65,3 @@ class PoseBuffer:
         t0, t1 = self._stamps[i - 1], self._stamps[i]
         alpha = (stamp - t0) / (t1 - t0)
         return interpolate(self._poses[i - 1], self._poses[i], alpha)
-
-    def clear(self) -> None:
-        self._stamps.clear()
-        self._poses.clear()

@@ -22,28 +22,28 @@ from ..core.common.config import EstimatorConfig, config_from_dict
 from ..core.common.model import CameraModel, TagKey, TagModel, normalize_family, tag_key_str
 from ..core.common.urdf import Urdf
 
-# Top-level node parameters and their defaults (see config/dock_fuser_sim.yaml
-# for what each one means).
+# The node's ROS name. Launched in the vehicle namespace, its topics are
+# /race_auv/race_auv_factorgraph/<name>.
+NODE_NAME = "race_auv_factorgraph"
+
+# Top-level node parameters and their defaults (config/factorgraph_sim.yaml
+# and race_auv_bringup/config/race_auv_factorgraph.yaml show them in use).
 NODE_DEFAULTS: Dict[str, Any] = {
     "odom_topic": "/race_auv/odometry/filtered",
     # DVL bottom-lock velocity (published only while the DVL has bottom
     # lock); "" disables the DVL dropout handling (core/frontend/dvl_monitor.py).
     "dvl_topic": "",
-    "graph_frame": "race_auv/odom",
+    # Frames (see ros/node.py). odom_frame is the EKF's; odom_graph_frame is
+    # the graph's drift-corrected odom frame, published as a child of it.
+    "odom_frame": "race_auv/odom",
+    "odom_graph_frame": "race_auv/odom_graph",
     "base_frame": "race_auv/base_link",
     "station_base_frame": "race_station/base_link",
     "dock_frame": "race_station/dock_point",
-    "publish_station_static_tf": True,
-    "dock_pose_topic": "dock_point/pose",
-    # Drop-in for the old apriltag_fuser's output (geometry_msgs/PoseStamped,
-    # dock_point in base_frame), with its "detection" meaning: published only
-    # on keyframes that added a tag factor, silent while no tag is seen. The
-    # docking mission counts these messages as tag detections. "" = off.
-    "compat_pose_topic": "",
-    # Graph-corrected odom frame: TF graph_frame -> corrected_frame =
-    # E_k * X_k^-1, so base_link sits at the graph's X_k in it (for Foxglove /
-    # RViz; the EKF's own odom drifts). "" = off.
-    "corrected_frame": "",
+    # Publish the station's own frames (station_base -> dock_point from the
+    # URDF, dock_point -> each tag at the graph's estimate). false when the
+    # station's robot_state_publisher runs: it publishes the same frames.
+    "publish_station_frames": True,
     # URDFs: an explicit path, or package + file inside its share directory.
     "auv_urdf_path": "",
     "auv_urdf_package": "race_auv_description",
@@ -59,7 +59,7 @@ NODE_DEFAULTS: Dict[str, Any] = {
     "tag_family": "36h11",
     "tag_ids": [146, 176, 185, 541, 558],
     "tag_sizes": [0.12, 0.12, 0.12, 0.04, 0.04],
-    # Cameras whose detections dock_fuser subscribes to (each also has
+    # Cameras whose detections the node subscribes to (each also has
     # cameras.<name>.enabled). keyframe_camera's detector messages are the
     # keyframe clock; every other enabled camera is attached to those
     # keyframes (core/frontend/scheduler.py). "" = the first enabled camera.
@@ -68,12 +68,8 @@ NODE_DEFAULTS: Dict[str, Any] = {
     # Keyframe scheduling: seconds of EKF history kept for interpolating E(t)
     # at each image stamp. Must exceed the worst detector + transport delay.
     "ekf_buffer_seconds": 30.0,
-    # Rate limit on the published odom -> station correction (§10).
-    "output_max_trans_rate": 0.5,   # m/s
-    "output_max_rot_rate": 0.5,     # rad/s
-    # Extra per-keyframe topics for analysis and live viewing (Foxglove):
-    # ~/auv_pose, ~/station_pose, ~/keyframe, ~/odometry, ~/path and
-    # ~/ekf_path. See ros/node.py.
+    # Analysis and display topics: ~/auv_pose, ~/keyframe, ~/path and
+    # ~/ekf_path (see ros/node.py).
     "publish_debug": False,
     # ~/path and ~/ekf_path: re-published at path_rate Hz, holding the last
     # path_length keyframes (3000 = 10 min at 5 Hz, ~250 kB per message each).
@@ -226,16 +222,22 @@ def build_setup(get: Callable[[str], Any], warn: Callable[[str], None]) -> Setup
                  keyframe_camera, [n for n in enabled if n != keyframe_camera])
 
 
-def flatten_params_yaml(path: str, node_name: str = "dock_fuser") -> Dict[str, Any]:
+def flatten_params_yaml(path: str, node_name: str = NODE_NAME) -> Dict[str, Any]:
     """Read a ROS 2 parameter file into flat dotted names (as the node would see them).
 
-    Reads the ``/**`` section (every node, e.g. the shared station tag list)
-    and the node's own section, the node's own winning, as ROS does.
+    Reads the ``/**`` section (every node, e.g. the shared station tag list),
+    then the node's own section, the node's own winning, as ROS does. The
+    node's section may be named in any of the ways ROS 2 accepts: ``name``,
+    ``/name``, ``/**/name`` or ``/race_auv/name``. For this node, sections of
+    its former name ``dock_fuser`` are read too, so the configs of older
+    recorded runs still load in the offline tools.
     """
     with open(path, "r", encoding="utf-8") as f:
         doc = yaml.safe_load(f) or {}
+    names = [node_name] + (["dock_fuser"] if node_name == NODE_NAME else [])
+    sections = ["/**"] + [f"{prefix}{n}" for n in names for prefix in ("", "/", "/**/", "/race_auv/")]
     params: Dict[str, Any] = {}
-    for section in ("/**", node_name, f"/{node_name}"):
+    for section in sections:
         params.update((doc.get(section) or {}).get("ros__parameters", {}))
     flat: Dict[str, Any] = {}
 
@@ -255,7 +257,7 @@ def getter_from_yaml(paths: Union[str, Sequence[str]]) -> Callable[[str], Any]:
 
     Several files are merged in order, later ones winning, exactly like
     ``--params-file a.yaml --params-file b.yaml`` on the node (e.g. the
-    shared station_tags.yaml, then dock_fuser.yaml).
+    shared station_tags.yaml, then race_auv_factorgraph.yaml).
     """
     flat: Dict[str, Any] = {}
     for path in ([paths] if isinstance(paths, str) else paths):
